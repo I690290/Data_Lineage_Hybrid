@@ -1,0 +1,351 @@
+* { box-sizing: border-box; }
+body { margin: 0; font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); }
+
+/* ---------- theme tokens (single place to re-skin) ----------
+   light values on :root; [data-theme='dark'] overrides below.
+   index.html sets data-theme before first paint; App.jsx keeps it in
+   sync with the Auto / Light / Dark toggle. */
+:root {
+  color-scheme: light;
+
+  --bg: #fff;
+  --surface: #fafafa;          /* toolbar */
+  --surface-2: #f9fafb;        /* alt rows, disabled buttons */
+  --surface-3: #f3f4f6;        /* hover */
+  --node-bg: #fff;
+  --border: #e5e7eb;
+  --border-strong: #d1d5db;
+  --text: #111827;
+  --text-soft: #374151;
+  --text-muted: #4b5563;
+  --text-faint: #6b7280;
+  --text-disabled: #d1d5db;
+  --canvas-dots: #91919a;
+  --shadow: rgba(0, 0, 0, 0.08);
+
+  /* edge contract: blue = DETERMINISTIC data flow, red = AI_INFERRED
+     (provisional), yellow = EXECUTES (control flow) - same in every view */
+  --edge-det: #2563eb;
+  --edge-det-soft: #93c5fd;
+  --edge-ai: #dc2626;
+  --edge-exec: #eab308;
+  --col-highlight-bg: #dbeafe;
+
+  --entity-table: #2563eb;
+  --entity-table-bg: #dbeafe;
+  --entity-table-fg: #1d4ed8;
+  --entity-view: #0ea5e9;
+  --entity-view-bg: #e0f2fe;
+  --entity-view-fg: #0369a1;
+  --entity-external: #b45309;
+  --entity-external-bg: #fef3c7;
+  --entity-external-fg: #92400e;
+  --entity-file: #0d9488;
+  --entity-file-bg: #ccfbf1;
+  --entity-file-fg: #0f766e;
+
+  --process-border: #7c3aed;
+  --process-bg: #f5f3ff;
+  --job-border: #ea580c;
+  --job-bg: #fff7ed;
+  --process-jcl-utility-bg: #ecfeff;
+  --process-jcl-utility-border: #0891b2;
+  --process-oracle-ext-bg: #fefce8;
+  --process-oracle-ext-border: #ca8a04;
+
+  --handle-bg: #94a3b8;
+  --tooltip-bg: #111827;
+  --tooltip-fg: #f9fafb;
+  --error-bg: #fef2f2;
+  --error-fg: #b91c1c;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #0f1117;
+  --surface: #161922;
+  --surface-2: #1c202b;
+  --surface-3: #252a37;
+  --node-bg: #1c202b;
+  --border: #2b3040;
+  --border-strong: #3b4254;
+  --text: #f3f4f6;
+  --text-soft: #d1d5db;
+  --text-muted: #9ca3af;
+  --text-faint: #8b93a3;
+  --text-disabled: #4b5563;
+  --canvas-dots: #3b4254;
+  --shadow: rgba(0, 0, 0, 0.45);
+
+  --edge-det: #60a5fa;
+  --edge-det-soft: #1e40af;
+  --edge-ai: #f87171;
+  --edge-exec: #facc15;
+  --col-highlight-bg: #1e3a5f;
+
+  --entity-table: #60a5fa;
+  --entity-table-bg: #1e3a5f;
+  --entity-table-fg: #93c5fd;
+  --entity-view: #38bdf8;
+  --entity-view-bg: #0c3349;
+  --entity-view-fg: #7dd3fc;
+  --entity-external: #f59e0b;
+  --entity-external-bg: #46300b;
+  --entity-external-fg: #fcd34d;
+  --entity-file: #2dd4bf;
+  --entity-file-bg: #0c3a36;
+  --entity-file-fg: #5eead4;
+
+  --process-border: #a78bfa;
+  --process-bg: #251f3d;
+  --job-border: #fb923c;
+  --job-bg: #3a2415;
+  --process-jcl-utility-bg: #103039;
+  --process-jcl-utility-border: #22d3ee;
+  --process-oracle-ext-bg: #38320f;
+  --process-oracle-ext-border: #eab308;
+
+  --handle-bg: #64748b;
+  --tooltip-bg: #2b3040;
+  --tooltip-fg: #f9fafb;
+  --error-bg: #3b1219;
+  --error-fg: #fca5a5;
+}
+
+.app { display: flex; flex-direction: column; height: 100vh; }
+.main-area { display: flex; flex: 1; overflow: hidden; min-height: 0; }
+.canvas { flex: 1; min-width: 0; }
+
+/* ---------- transformation side panel ---------- */
+.side-panel {
+  width: 420px; min-width: 300px; max-width: 500px;
+  background: var(--surface); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow-y: auto; flex-shrink: 0;
+}
+.panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  position: sticky; top: 0; background: var(--surface); z-index: 1;
+}
+.panel-title { display: flex; align-items: center; gap: 8px; }
+.panel-edge-type { font-size: 12px; font-weight: 600; color: var(--text); }
+.panel-close {
+  border: 1px solid var(--border-strong); background: var(--node-bg);
+  border-radius: 6px; width: 26px; height: 26px; cursor: pointer;
+  color: var(--text-muted); font-size: 16px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+}
+.panel-close:hover { background: var(--surface-3); color: var(--text); }
+.panel-section { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.panel-section-title {
+  font-size: 10px; font-weight: 700; color: var(--text-faint);
+  letter-spacing: 0.6px; text-transform: uppercase; margin-bottom: 6px;
+  cursor: default;
+}
+.panel-col-mapping { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.panel-col {
+  font-family: 'SF Mono', Menlo, monospace; font-size: 11px;
+  color: var(--entity-table); background: var(--entity-table-bg);
+  padding: 2px 8px; border-radius: 4px; word-break: break-all;
+}
+.panel-arrow { color: var(--text-faint); font-size: 14px; flex-shrink: 0; }
+.panel-meta {
+  padding: 5px 14px; font-size: 11px; color: var(--text-faint);
+  font-style: italic; border-bottom: 1px solid var(--border);
+}
+.panel-ai-section { display: flex; flex-direction: column; gap: 5px; }
+.panel-ai-row { display: flex; align-items: center; gap: 10px; }
+.panel-confidence { font-size: 11px; font-weight: 700; color: var(--edge-ai); }
+.panel-status {
+  font-size: 10px; color: #fbbf24; background: rgba(251,191,36,0.1);
+  padding: 1px 7px; border-radius: 4px;
+}
+.panel-reasoning { font-size: 11px; font-style: italic; color: #fcd34d; }
+.panel-model { font-size: 10px; color: var(--text-faint); }
+.panel-code-section { display: flex; flex-direction: column; }
+.panel-code-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px;
+}
+.panel-code-lang {
+  font-size: 10px; font-weight: 700; color: var(--text-faint); letter-spacing: 0.5px;
+}
+.panel-copy-btn {
+  border: 1px solid var(--border-strong); background: var(--node-bg);
+  border-radius: 5px; padding: 3px 10px; font-size: 11px;
+  cursor: pointer; color: var(--text-muted);
+}
+.panel-copy-btn:hover { background: var(--surface-3); color: var(--text); }
+.panel-copy-btn.copied { border-color: #10b981; color: #10b981; background: rgba(16,185,129,0.08); }
+.panel-code {
+  margin: 0; padding: 10px 12px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+  font-family: 'SF Mono', Menlo, monospace; font-size: 11px; color: var(--text-soft);
+  white-space: pre-wrap; word-break: break-word; line-height: 1.6;
+}
+.panel-evidence summary { cursor: pointer; }
+.panel-evidence-code { margin-top: 8px; max-height: 200px; overflow-y: auto; }
+
+/* ---------- toolbar ---------- */
+.toolbar {
+  display: flex; align-items: center; gap: 18px;
+  padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--surface);
+  flex-wrap: wrap;
+}
+.toolbar h1 { font-size: 16px; margin: 0 12px 0 0; color: var(--text); }
+.toolbar label { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); }
+.toolbar select, .toolbar input {
+  font-size: 13px; padding: 4px 6px; border: 1px solid var(--border-strong); border-radius: 6px;
+  background: var(--node-bg); color: var(--text);
+}
+.toolbar input[type="number"] { width: 52px; }
+
+/* ---------- view tabs (Data Lineage / Process Lineage) ---------- */
+.view-tabs { display: flex; border-bottom: 2px solid transparent; gap: 2px; }
+.view-tabs button {
+  border: none; background: transparent; padding: 8px 14px; font-size: 13px;
+  font-weight: 600; color: var(--text-faint); cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -2px;
+}
+.view-tabs button:hover { color: var(--text); }
+.view-tabs button.active { color: var(--edge-det); border-bottom-color: var(--edge-det); }
+
+.level-toggle, .theme-toggle { display: flex; border: 1px solid var(--border-strong); border-radius: 8px; overflow: hidden; }
+.level-toggle button, .theme-toggle button {
+  border: none; background: var(--node-bg); padding: 6px 12px; font-size: 12px; cursor: pointer; color: var(--text-muted);
+}
+.level-toggle button.active, .theme-toggle button.active { background: var(--edge-det); color: var(--bg); }
+.level-toggle button:disabled { color: var(--text-disabled); cursor: not-allowed; background: var(--surface-2); }
+.level-toggle button.active:disabled { background: var(--edge-det-soft); color: var(--bg); }
+
+.relayout-btn {
+  border: 1px solid var(--border-strong); background: var(--node-bg); border-radius: 8px;
+  padding: 6px 12px; font-size: 12px; cursor: pointer; color: var(--text-muted);
+}
+.relayout-btn:hover { background: var(--surface-3); color: var(--text); }
+
+.legend { display: flex; gap: 14px; font-size: 11px; color: var(--text-faint); margin-left: auto; }
+/* longhands only: a `border-top` shorthand here would reset color/style to
+   currentcolor at higher specificity than the per-kind rules below */
+.legend i.line {
+  display: inline-block; width: 26px; height: 0;
+  border-top-width: 2px; border-top-style: solid;
+  vertical-align: middle; margin-right: 4px;
+}
+.legend i.det { border-top-color: var(--edge-det); }
+.legend i.ai { border-top-color: var(--edge-ai); border-top-style: dashed; }
+.legend i.exec { border-top-color: var(--edge-exec); }
+.loading { font-size: 12px; color: var(--text-faint); }
+.error-banner { background: var(--error-bg); color: var(--error-fg); padding: 8px 16px; font-size: 13px; }
+
+/* ---------- data-entity node (Table / View / External / File) ---------- */
+.table-node {
+  width: 280px; background: var(--node-bg); border: 1.5px solid var(--entity-table); border-radius: 10px;
+  font-size: 12px; box-shadow: 0 2px 6px var(--shadow);
+}
+.table-node.entity-view { border-color: var(--entity-view); border-style: dashed; }
+.table-node.entity-external { border-color: var(--entity-external); border-style: double; border-width: 3px; }
+.table-node.entity-file { border-color: var(--entity-file); }
+
+.table-node-header { display: flex; align-items: center; gap: 8px; padding: 10px 12px; }
+.table-node-name { font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+
+.kind-badge { font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.5px; white-space: nowrap; }
+.badge-table { background: var(--entity-table-bg); color: var(--entity-table-fg); }
+.badge-view { background: var(--entity-view-bg); color: var(--entity-view-fg); }
+.badge-external { background: var(--entity-external-bg); color: var(--entity-external-fg); }
+.badge-file { background: var(--entity-file-bg); color: var(--entity-file-fg); }
+
+/* type icons are pure CSS so themes stay style-only */
+.entity-icon::before { font-size: 13px; line-height: 1; }
+.icon-table::before { content: '▦'; color: var(--entity-table); }
+.icon-view::before { content: '◎'; color: var(--entity-view); }
+.icon-external::before { content: '⇲'; color: var(--entity-external); }
+.icon-file::before { content: '☰'; color: var(--entity-file); }
+
+.expand-btn {
+  border: 1px solid var(--border-strong); background: var(--surface-2); border-radius: 5px;
+  width: 20px; height: 20px; line-height: 1; cursor: pointer; color: var(--text-soft);
+}
+.table-node-columns { border-top: 1px solid var(--border); padding: 4px 0; }
+.column-row { position: relative; display: flex; align-items: center; height: 24px; padding: 0 12px; }
+.column-row:nth-child(odd) { background: var(--surface-2); }
+.column-name { font-family: 'SF Mono', Menlo, monospace; font-size: 11px; color: var(--text-soft); }
+/* record-level pseudo-column ('*' = whole record, COBOL READ INTO) */
+.column-row.record-row .column-name { font-style: italic; color: var(--text-faint); }
+
+/* ---------- column path highlighting (click a column in drill-down) ----- */
+.column-row.col-focusable { cursor: pointer; }
+.column-row.col-focusable:hover { background: var(--surface-3); }
+.column-row.col-highlight,
+.column-row.col-highlight:nth-child(odd) { background: var(--col-highlight-bg); }
+.column-row.col-highlight .column-name { color: var(--edge-det); font-weight: 700; }
+.table-node.node-dim, .process-node.node-dim { opacity: 0.25; }
+
+/* ---------- process node ---------- */
+.process-node {
+  display: flex; align-items: center; gap: 8px; width: 200px; padding: 6px 10px;
+  background: var(--process-bg); border: 1.5px solid var(--process-border); border-radius: 18px;
+  box-shadow: 0 1px 4px var(--shadow);
+}
+.process-node.job-node { background: var(--job-bg); border-color: var(--job-border); }
+.process-node.process-jcl-utility { background: var(--process-jcl-utility-bg); border-color: var(--process-jcl-utility-border); }
+.process-node.process-oracle-ext { background: var(--process-oracle-ext-bg); border-color: var(--process-oracle-ext-border); }
+.process-icon::before { font-size: 15px; }
+.icon-program::before { content: 'ƒ'; }
+.icon-job::before { content: '⚙'; }
+.process-body { display: flex; flex-direction: column; overflow: hidden; }
+.process-name { font-size: 12px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.process-lang { font-size: 9px; color: var(--text-faint); letter-spacing: 0.5px; }
+
+/* ---------- handles ---------- */
+.entity-handle { width: 8px; height: 8px; background: var(--handle-bg); }
+.column-handle { width: 6px; height: 6px; background: var(--edge-det); border: none; }
+
+/* ---------- edge labels & tooltip ---------- */
+.edge-via-label {
+  position: absolute; z-index: 5; pointer-events: none;
+  background: var(--node-bg); border: 1px solid var(--border-strong); color: var(--text-muted);
+  border-radius: 9px; padding: 1px 8px; font-size: 9px; font-weight: 600;
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.edge-conf-badge {
+  position: absolute; z-index: 5; pointer-events: none;
+  background: var(--node-bg); border: 1px solid var(--edge-ai); color: var(--edge-ai);
+  border-radius: 9px; padding: 1px 8px; font-size: 9px; font-weight: 700;
+  letter-spacing: 0.3px; white-space: nowrap;
+}
+.edge-tooltip {
+  position: absolute; z-index: 10; pointer-events: none;
+  background: var(--tooltip-bg); color: var(--tooltip-fg); border-radius: 8px; padding: 8px 10px;
+  font-size: 11px; max-width: 380px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.tooltip-row { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+.prov-chip { font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 4px; }
+.chip-det { background: #1d4ed8; color: #fff; }
+.chip-ai { background: var(--edge-ai); color: #fff; }
+.status-chip { font-size: 9px; color: #fbbf24; }
+.tooltip-type { color: #9ca3af; font-size: 10px; }
+.tooltip-reasoning {
+  font-style: italic; color: #fcd34d; font-size: 10px;
+  margin-bottom: 4px; max-width: 360px;
+}
+.tooltip-cols { font-family: monospace; font-size: 10px; color: #93c5fd; margin-bottom: 3px; }
+.tooltip-logic {
+  margin: 0; white-space: pre-wrap; word-break: break-word;
+  font-size: 10px; color: #d1d5db; max-height: 120px; overflow: hidden;
+}
+.tooltip-program { margin-top: 4px; color: #9ca3af; font-size: 10px; font-style: italic; }
+
+/* ---------- React Flow chrome (canvas, controls, minimap) ---------- */
+.react-flow { background: var(--bg); }
+.react-flow__background pattern circle { fill: var(--canvas-dots); }
+.react-flow__controls { box-shadow: 0 2px 6px var(--shadow); }
+.react-flow__controls-button {
+  background: var(--node-bg); border-bottom: 1px solid var(--border); fill: var(--text-soft);
+}
+.react-flow__controls-button:hover { background: var(--surface-3); }
+.react-flow__minimap { background: var(--surface); }
+.react-flow__minimap-mask { fill: var(--shadow); }
+.react-flow__attribution { display: none; }

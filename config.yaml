@@ -1,0 +1,25 @@
+# Hybrid Data Lineage Engine configuration.
+# Secrets live in .env - this file holds behaviour only.
+
+ai:
+  enabled: true                # false -> deterministic-only (dynamic constructs stay flagged)
+  provider: nvidia             # bedrock | nvidia  (swappable, no code change)
+  confidence_threshold: 0.6    # AI edges scoring below this are dropped
+
+  nvidia:
+    base_url: https://integrate.api.nvidia.com/v1
+    chat_model: meta/llama-3.3-70b-instruct
+    embed_model: nvidia/nv-embedqa-e5-v5
+
+  bedrock:
+    region: eu-west-2
+    chat_model: amazon.nova-pro-v1:0
+    embed_model: amazon.titan-embed-text-v2:0
+
+neo4j:
+  uri: bolt://localhost:7687
+  user: neo4j
+  database: neo4j
+
+ingestion:
+  source_dir: ./mock-code
