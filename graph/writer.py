@@ -94,6 +94,8 @@ class Neo4jWriter:
                 if not src_ref:
                     continue
                 src_id, src_owner, src_col = _col_ref(src_ref, entity_id)
+                steps = cm.transform_steps or (
+                    [cm.transformation] if cm.transformation else [])
                 session.run(
                     "MERGE (s:Column {id: $sid}) "
                     "  SET s.name = $scol, s.owner_id = $sowner "
@@ -101,6 +103,7 @@ class Neo4jWriter:
                     "  SET t.name = $tcol, t.owner_id = $towner "
                     "MERGE (s)-[r:TRANSFORMS_TO {program: $program}]->(t) "
                     "SET r.edge_id = $edge_id, r.transformation = $logic, "
+                    "    r.transform_steps = $steps, "
                     "    r.provenance = $provenance, r.status = $status, "
                     "    r.confidence = $confidence, r.reasoning = $reasoning, "
                     "    r.evidence = $evidence, "
@@ -109,7 +112,7 @@ class Neo4jWriter:
                     tid=tgt_id, tcol=tgt_col, towner=tgt_owner,
                     program=edge.program or "",
                     edge_id=f"{edge.id}:{src_col}>{tgt_col}",
-                    logic=cm.transformation,
+                    logic=cm.transformation, steps=json.dumps(steps),
                     provenance=edge.provenance.value, status=edge.status.value,
                     confidence=edge.confidence, reasoning=edge.reasoning,
                     evidence=edge.evidence,

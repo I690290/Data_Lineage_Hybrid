@@ -47,16 +47,29 @@ from parsers.base import (
 
 from .base import AIProvider
 from .evaluator import EdgeEvaluator
-from .resolver import _COLUMN_SYSTEM, _SYSTEM, _named
+from .resolver import _COLUMN_SYSTEM, _SYSTEM, _named, _strip_kind_prefix
 
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
 # Graph state
-# operator.add reducers on the lists let parallel branches accumulate outputs
+#
+# Two schemas because LangGraph fan-out (Send) does NOT commit per-branch
+# payloads to shared channels: a node reached via Send reads its Send payload
+# as input, but the *conditional edge* after it reads the committed channel
+# snapshot — where per-branch scalars are still their START value. Routing on
+# a shared scalar therefore sees None, and parallel branches writing the same
+# non-reducer channel collide ("can receive only one value per step").
+#
+# So each proposal runs in its own isolated subgraph (ProposalState): the Send
+# payload seeds that subgraph's channels, so its internal routing reads the
+# correct per-branch values, and concurrent branches never share scalars. Only
+# the operator.add reducer channels (ProposalOutput) bubble back to the outer
+# graph (ResolverState) and merge across all branches.
 # ---------------------------------------------------------------------------
 class ResolverState(TypedDict):
+    """Outer graph: one LLM resolve call, then fan-out to per-proposal subgraphs."""
     # ── inputs set once at START ──────────────────────────────────────────
     construct: DynamicConstruct
     known_entities: list[str]
@@ -64,17 +77,45 @@ class ResolverState(TypedDict):
     evaluator: Any         # EdgeEvaluator
     threshold: float
 
-    # ── resolve_node output (shared across all branches) ──────────────────
+    # ── resolve_node output (handed to each branch via the Send payload) ──
     proposals: list[dict]
     self_confidence: float | None
     overall_reasoning: str
     prompt_context: str    # stored in ai_metadata for audit trail
 
-    # ── per-branch working state (set by Send fan-out) ────────────────────
-    current_proposal: dict | None
+    # ── accumulated outputs (operator.add merges all branches) ────────────
+    emitted_nodes: Annotated[list[EntityNode], operator.add]
+    emitted_edges: Annotated[list[LineageEdge], operator.add]
+
+
+class ProposalState(TypedDict):
+    """Inner subgraph: evaluate → route → [column_retry] → emit for ONE proposal.
+
+    Seeded per Send, so its channels carry this branch's proposal in isolation.
+    """
+    # ── seeded from the Send payload ──────────────────────────────────────
+    construct: DynamicConstruct
+    provider: Any
+    evaluator: Any
+    threshold: float
+    self_confidence: float | None
+    overall_reasoning: str
+    prompt_context: str
+    current_proposal: dict
     verdict: dict | None
 
-    # ── accumulated outputs (operator.add merges all branches) ────────────
+    # ── outputs (reducers) — the only channels exported to the outer graph ─
+    emitted_nodes: Annotated[list[EntityNode], operator.add]
+    emitted_edges: Annotated[list[LineageEdge], operator.add]
+
+
+class ProposalOutput(TypedDict):
+    """Restricts the subgraph's exported channels to the reducer aggregators.
+
+    Without this the subgraph would also return its scalar inputs (construct,
+    provider, …), and every branch writing those non-reducer channels in the
+    same super-step would collide on the outer graph.
+    """
     emitted_nodes: Annotated[list[EntityNode], operator.add]
     emitted_edges: Annotated[list[LineageEdge], operator.add]
 
@@ -109,6 +150,12 @@ def resolve_node(state: ResolverState) -> dict:
     clean: list[dict] = []
     for prop in proposals:
         edge_type_raw = prop.get("edge_type", "WRITES_TO")
+        # the model sometimes returns an already-prefixed entity (e.g.
+        # "FILE:CR_ACX_VALID_*"); strip it so emit_node doesn't double-prefix
+        # into "FILE:FILE:..." and so dedup collapses prefixed/bare variants
+        for fld in ("source_entity", "target_entity"):
+            if _named(prop.get(fld)):
+                prop[fld] = _strip_kind_prefix(prop[fld])
         anchor = (prop.get("target_entity") if edge_type_raw == "WRITES_TO"
                   else prop.get("source_entity"))
         if edge_type_raw not in ("READS_FROM", "WRITES_TO") or not _named(anchor):
@@ -131,15 +178,34 @@ def resolve_node(state: ResolverState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Fan-out: after resolve, send one branch per proposal to evaluate
+# Fan-out: after resolve, run one isolated proposal subgraph per proposal
 # ---------------------------------------------------------------------------
 def fan_out_proposals(state: ResolverState):
-    """Return a Send per proposal so each is evaluated independently."""
+    """Return a Send per proposal so each runs in its own isolated subgraph.
+
+    The payload seeds the subgraph's channels, so its internal routing reads
+    this branch's proposal (not a shared channel that Send never commits).
+    """
     proposals = state.get("proposals", [])
     if not proposals:
         return [END]
     return [
-        Send("evaluate", {**state, "current_proposal": prop, "verdict": None})
+        Send(
+            "proposal",
+            {
+                "construct":         state["construct"],
+                "provider":          state["provider"],
+                "evaluator":         state["evaluator"],
+                "threshold":         state["threshold"],
+                "self_confidence":   state["self_confidence"],
+                "overall_reasoning": state["overall_reasoning"],
+                "prompt_context":    state["prompt_context"],
+                "current_proposal":  prop,
+                "verdict":           None,
+                "emitted_nodes":     [],
+                "emitted_edges":     [],
+            },
+        )
         for prop in proposals
     ]
 
@@ -147,7 +213,7 @@ def fan_out_proposals(state: ResolverState):
 # ---------------------------------------------------------------------------
 # Node: judge evaluates the current proposal
 # ---------------------------------------------------------------------------
-def evaluate_node(state: ResolverState) -> dict:
+def evaluate_node(state: ProposalState) -> dict:
     evaluator: EdgeEvaluator = state["evaluator"]
     prop    = state["current_proposal"]
     verdict = evaluator.evaluate(state["construct"], prop)
@@ -162,7 +228,7 @@ def evaluate_node(state: ResolverState) -> dict:
 # ---------------------------------------------------------------------------
 # Routing: drop / reflexion-retry / emit
 # ---------------------------------------------------------------------------
-def route_after_evaluate(state: ResolverState) -> str:
+def route_after_evaluate(state: ProposalState) -> str:
     verdict   = state["verdict"]
     threshold = state["threshold"]
     prop      = state["current_proposal"]
@@ -186,7 +252,7 @@ def route_after_evaluate(state: ResolverState) -> str:
 # ---------------------------------------------------------------------------
 # Node: Reflexion — observe missing columns, reflect, re-invoke LLM
 # ---------------------------------------------------------------------------
-def column_retry_node(state: ResolverState) -> dict:
+def column_retry_node(state: ProposalState) -> dict:
     provider: AIProvider = state["provider"]
     construct = state["construct"]
     prop      = state["current_proposal"]
@@ -225,7 +291,7 @@ def column_retry_node(state: ResolverState) -> dict:
 # ---------------------------------------------------------------------------
 # Node: build EntityNode + LineageEdge and accumulate via operator.add
 # ---------------------------------------------------------------------------
-def emit_node(state: ResolverState) -> dict:
+def emit_node(state: ProposalState) -> dict:
     construct        = state["construct"]
     prop             = state["current_proposal"]
     verdict          = state["verdict"]
@@ -291,22 +357,17 @@ def emit_node(state: ResolverState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Compile the graph once at module import
+# Inner subgraph: evaluate → route → [column_retry] → emit for ONE proposal.
+# Each Send invocation runs this with isolated state (see ProposalState).
 # ---------------------------------------------------------------------------
-def _build_graph():
-    g = StateGraph(ResolverState)
+def _build_proposal_graph():
+    g = StateGraph(ProposalState, output_schema=ProposalOutput)
 
-    g.add_node("resolve",      resolve_node)
     g.add_node("evaluate",     evaluate_node)
     g.add_node("column_retry", column_retry_node)
     g.add_node("emit",         emit_node)
 
-    g.set_entry_point("resolve")
-
-    # Fan-out: one Send per proposal → evaluate
-    g.add_conditional_edges("resolve", fan_out_proposals, ["evaluate", END])
-
-    # Per-proposal routing after judge
+    g.set_entry_point("evaluate")
     g.add_conditional_edges(
         "evaluate",
         route_after_evaluate,
@@ -314,6 +375,28 @@ def _build_graph():
     )
     g.add_edge("column_retry", "emit")
     g.add_edge("emit", END)
+
+    return g.compile()
+
+
+_PROPOSAL_GRAPH = _build_proposal_graph()
+
+
+# ---------------------------------------------------------------------------
+# Outer graph: resolve once, then fan-out one proposal subgraph per proposal.
+# Compiled once at module import.
+# ---------------------------------------------------------------------------
+def _build_graph():
+    g = StateGraph(ResolverState)
+
+    g.add_node("resolve",  resolve_node)
+    g.add_node("proposal", _PROPOSAL_GRAPH)
+
+    g.set_entry_point("resolve")
+
+    # Fan-out: one Send per proposal → isolated proposal subgraph
+    g.add_conditional_edges("resolve", fan_out_proposals, ["proposal", END])
+    g.add_edge("proposal", END)
 
     return g.compile()
 
@@ -371,8 +454,6 @@ class LineageGraphRunner:
             "self_confidence":   None,
             "overall_reasoning": "",
             "prompt_context":    "",
-            "current_proposal":  None,
-            "verdict":           None,
             "emitted_nodes":     [],
             "emitted_edges":     [],
         }

@@ -187,6 +187,14 @@ body { margin: 0; font-family: 'Inter', -apple-system, sans-serif; background: v
 .panel-evidence summary { cursor: pointer; }
 .panel-evidence-code { margin-top: 8px; max-height: 200px; overflow-y: auto; }
 
+/* ordered transformation chain (source -> target) */
+.panel-steps { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 6px; }
+.panel-steps .panel-step { color: var(--text-soft); }
+.panel-steps .panel-step code {
+  font-family: 'SF Mono', Menlo, monospace; font-size: 11px;
+  white-space: pre-wrap; word-break: break-word; line-height: 1.5;
+}
+
 /* ---------- toolbar ---------- */
 .toolbar {
   display: flex; align-items: center; gap: 18px;

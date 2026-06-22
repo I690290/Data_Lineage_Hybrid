@@ -423,6 +423,28 @@ def test_ai_malformed_and_duplicate_proposals_filtered():
     assert [m.target_column for m in edges[0].column_mappings] == ["WEIGHTED_RISK"]
 
 
+def test_ai_prefixed_entity_name_not_double_prefixed():
+    """Models sometimes echo the kind prefix into the entity name
+    (`FILE:CR_ACX_VALID_*`). emit must not re-prefix it into
+    `FILE:FILE:...`, and the bare/prefixed variants must dedupe to one edge."""
+    payloads = [
+        {"lineage": [
+            {"source_entity": "PROGRAM:FTP.STEP010",
+             "target_entity": "FILE:CR_ACX_VALID_*", "target_kind": "File",
+             "edge_type": "WRITES_TO", "reasoning": "ftp put"},
+            {"source_entity": "FTP.STEP010",          # same edge, bare names
+             "target_entity": "CR_ACX_VALID_*", "target_kind": "File",
+             "edge_type": "WRITES_TO", "reasoning": "ftp put dup"},
+        ], "confidence_score": 0.8, "reasoning": "overall"},
+        {"confidence": 0.9, "verdict": "ACCEPT", "rationale": "ok"},
+    ]
+    resolver = EdgeResolver(FakeProvider(payloads), threshold=0.6)
+    nodes, edges = resolver.resolve_all([_construct()], known_entities=[])
+    assert len(edges) == 1                       # deduped to one
+    assert edges[0].target_id == "FILE:CR_ACX_VALID_*"   # not FILE:FILE:...
+    assert all(n.id.count(":") == 1 for n in nodes)
+
+
 def test_ai_edge_below_judge_threshold_is_dropped():
     payloads = [
         {"lineage": [{"source_entity": "X", "target_entity": "X",

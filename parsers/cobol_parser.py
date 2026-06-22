@@ -229,6 +229,12 @@ class CobolParser:
                 field_owner[f] = node.id
 
         transforms = self._parse_transforms(text, logical_to_dd, file_nodes, ws_groups)
+        # whole-record MOVE recA TO recB (a byte-for-byte group copy) -> expand
+        # to elementary field lineage and fold into the transform graph so it
+        # chains transitively (WS/LINKAGE intermediaries, READ INTO, etc.)
+        records = self._parse_record_layouts(lines)
+        self._expand_group_moves(text, records, file_nodes, {},
+                                 transforms, program, result)
         ws_literals = self._parse_ws_literals(lines)
         self._parse_exec_sql(lines, text, program, program_node, field_owner,
                              transforms, ws_literals, result)
@@ -244,12 +250,12 @@ class CobolParser:
                     edge_type=EdgeType.READS_FROM, program=program,
                     evidence=f"SELECT {logical} ASSIGN TO {node.name} / OPEN INPUT"))
             else:
+                mappings = self._build_write_mappings(node, transforms, field_owner)
                 edge = LineageEdge(
                     source_id=program_node.id, target_id=node.id,
                     edge_type=EdgeType.WRITES_TO, program=program,
                     transformation=f"OPEN {mode} {logical}",
-                    column_mappings=self._build_write_mappings(
-                        node, transforms, field_owner),
+                    column_mappings=mappings,
                     evidence=f"SELECT {logical} ASSIGN TO {node.name} / OPEN {mode}")
                 result.edges.append(edge)
                 output_edges.append((edge, node))
@@ -274,12 +280,137 @@ class CobolParser:
             sources = [s for s in sources if not s.startswith(node.id)]
             if not sources:
                 continue
-            logic = "; ".join(dict.fromkeys(logics)) or "direct"
+            steps = list(dict.fromkeys(s for s in logics if s))  # source->target
             mappings.append(ColumnMapping(
                 source_columns=sources,
                 target_column=f"{node.id}|{field}",
-                transformation=logic[:400]))
+                transformation=("; ".join(steps) or "direct")[:600],
+                transform_steps=steps))
         return mappings
+
+    def _parse_record_layouts(self, lines: list[tuple[int, str]]) -> dict:
+        """Symbol table of every 01-level record/group area across the FILE,
+        WORKING-STORAGE and LINKAGE sections: ``record name -> {section, fd,
+        fields:[{field,start,length}], valid}``.  ``fields`` are the elementary
+        items with 1-based byte offsets (COBOL group-move semantics are a
+        byte-for-byte copy, so byte offset is the field correspondence).  FILE
+        records also carry ``fd`` (the logical file that owns the bytes).
+        ``valid`` is False if OCCURS/REDEFINES makes offsets non-linear."""
+        records: dict[str, dict] = {}
+        section: str | None = None
+        fd_name: str | None = None
+        cur: str | None = None
+        for _, code in lines:
+            u = code.upper().strip()
+            if u.startswith("FILE SECTION"):
+                section, fd_name, cur = "FILE", None, None
+                continue
+            if u.startswith("WORKING-STORAGE SECTION"):
+                section, fd_name, cur = "WORKING-STORAGE", None, None
+                continue
+            if u.startswith("LINKAGE SECTION"):
+                section, fd_name, cur = "LINKAGE", None, None
+                continue
+            if u.startswith("PROCEDURE DIVISION"):
+                break
+            if section is None:
+                continue
+            fd = _RE_FD.match(code)
+            if fd and section == "FILE":
+                fd_name, cur = fd.group(1).upper(), None
+                continue
+            fm = _RE_FIELD.match(code)
+            if not fm:
+                continue
+            level, name = int(fm.group(1)), fm.group(2).upper()
+            if level == 88:
+                continue
+            if level == 1:
+                cur = name
+                records[cur] = {"section": section,
+                                "fd": fd_name if section == "FILE" else None,
+                                "fields": [], "offset": 1, "valid": True}
+                continue
+            if cur is None:
+                continue
+            rec = records[cur]
+            if _RE_LAYOUT_UNSUPPORTED.search(code):
+                rec["valid"] = False
+            pic = _RE_PIC_CLAUSE.search(code)
+            if pic:
+                length = _pic_storage_length(pic.group(1).rstrip("."), pic.group(2))
+                if name != "FILLER":
+                    rec["fields"].append({"field": name, "start": rec["offset"],
+                                          "length": length})
+                rec["offset"] += length
+        for rec in records.values():
+            rec.pop("offset", None)
+        # keep only true GROUP records (>=2 subordinate fields): an elementary
+        # 01 (a single PIC X area, e.g. a metric/print line) is one field, so a
+        # MOVE into it is an ordinary elementary move the transform graph
+        # already resolves - not a group copy.
+        return {k: v for k, v in records.items() if len(v["fields"]) >= 2}
+
+    def _expand_group_moves(self, text, records, file_nodes, fd_to_logical,
+                            transforms, program, result) -> None:
+        """Generic whole-record move resolution.  ``MOVE recA TO recB`` where
+        both are known record areas is a byte-for-byte copy; expand it to
+        elementary field correspondences (paired by byte offset) and feed them
+        into the transform graph so they chain transitively - through WS/LINKAGE
+        intermediaries, READ INTO, and further moves - exactly like elementary
+        MOVEs.  A source field on a FILE record is a qualified terminal
+        (``<file_id>|field``); on a WS/LINKAGE record it stays a bare name the
+        resolver chains further.  A move whose records cannot be aligned
+        deterministically lands in COVERAGE telemetry - never silently dropped,
+        never guessed (the agentic layer may still propose a correspondence)."""
+        for m in _RE_MOVE.finditer(text):
+            s, t = m.group(1).upper(), m.group(2).upper()
+            if s not in records or t not in records:
+                continue                      # not a record-to-record move
+            pairs = self._pair_record_fields(records[s], records[t])
+            if not pairs:
+                line = text[:m.start()].count("\n") + 1
+                result.unparsed.append(UnparsedStatement(
+                    program=program, language=self.language,
+                    statement_type="COBOL_GROUP_MOVE",
+                    snippet=f"MOVE {s} TO {t}", path=result.path, line=line,
+                    reason="group move between records with no alignable byte "
+                           "layout (OCCURS/REDEFINES or mismatched structure)"))
+                continue
+            src_owner = self._record_entity_id(records[s], file_nodes, fd_to_logical)
+            for sf, tf in pairs:
+                src_ref = f"{src_owner}|{sf}" if src_owner else sf
+                self._add_transform(
+                    transforms, tf, [src_ref],
+                    f"group move: MOVE {s} TO {t} (whole-record copy)")
+
+    @staticmethod
+    def _pair_record_fields(srec: dict, trec: dict) -> list[tuple[str, str]]:
+        """Pair source/target elementary fields of a group move.  By BYTE START
+        position when both layouts are reliable (the correct COBOL semantics);
+        ordinal only as a fallback when offsets are unavailable but the field
+        counts match; otherwise no pairing (caller routes to telemetry)."""
+        sf, tf = srec["fields"], trec["fields"]
+        if not sf or not tf:
+            return []
+        if srec["valid"] and trec["valid"]:
+            src_by_start = {f["start"]: f["field"] for f in sf}
+            return [(src_by_start[t["start"]], t["field"])
+                    for t in tf if t["start"] in src_by_start]
+        if len(sf) == len(tf):
+            return [(a["field"], b["field"]) for a, b in zip(sf, tf)]
+        return []
+
+    @staticmethod
+    def _record_entity_id(rec: dict, file_nodes: dict,
+                          fd_to_logical: dict) -> str | None:
+        """The lineage entity that owns a record's bytes: its FILE node id for
+        an FD record, else None (a WS/LINKAGE area is internal - its fields
+        chain on through the transform graph)."""
+        fd = rec.get("fd")
+        logical = fd_to_logical.get(fd, fd) if fd else None
+        node = file_nodes.get(logical) if logical else None
+        return node.id if node else None
 
     def _parse_call_sites(self, lines, text) -> list[dict]:
         """Static CALL 'literal' USING sites (dynamic targets stay telemetry)."""
@@ -427,8 +558,9 @@ class CobolParser:
                 # elementary 01 record (e.g. 01 XML-OUTPUT-RECORD PIC X)
                 if level > 1 or "PIC" in fm.group(3).upper():
                     fields[current].append(name)
-        return fields, {k: v for k, v in layouts.items()
-                        if v and layout_valid.get(k, False)}
+        return (fields,
+                {k: v for k, v in layouts.items()
+                 if v and layout_valid.get(k, False)})
 
     def _parse_ws_groups(self, lines: list[tuple[int, str]]) -> dict[str, list[str]]:
         return self._parse_section_groups(lines, "WORKING-STORAGE SECTION")
@@ -504,7 +636,12 @@ class CobolParser:
 
     def _resolve(self, var: str, transforms: dict, field_owner: dict,
                  depth: int = 0, seen: frozenset = frozenset()) -> tuple[list[str], list[str]]:
-        """Resolve a variable to qualified terminal sources + the logic chain."""
+        """Resolve a variable to qualified terminal sources + the logic chain.
+
+        ``logics`` is ordered SOURCE -> TARGET: the deepest (closest to the
+        origin column) step first, this variable's own step last, so the chain
+        reads the way data actually flows (e.g. ``TRIM(A.COL); MOVE HV-X TO
+        OUT-FLD``) and the frontend can render the WS hops in order."""
         var = var.upper()
         if depth > 12 or var in seen:
             return [], []
@@ -514,12 +651,13 @@ class CobolParser:
         # transform target - its lineage is the chain, not itself
         if var in transforms:
             sources, logic = transforms[var]
-            resolved, logics = [], [logic]
+            resolved, logics = [], []
             for s in sources:
                 r, l = self._resolve(s, transforms, field_owner,
                                      depth + 1, seen | {var})
                 resolved.extend(r)
                 logics.extend(l)
+            logics.append(logic)             # this step is closest to target
             return list(dict.fromkeys(resolved)), logics
         if var in field_owner:               # file field terminal
             return [f"{field_owner[var]}|{var}"], []

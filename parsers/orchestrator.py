@@ -10,6 +10,7 @@ purely deterministic join, no inference involved.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .base import (
@@ -57,6 +58,10 @@ class ParserOrchestrator:
         self._cobol.resolve_calls(combined)
         self._cross_link_dd_bindings(combined)
         self._dedupe_nodes(combined)
+        # FTP `put <dsn> <remote-with-&symbol>`: reconcile the symbolic remote
+        # name against the concrete downstream filename (Oracle external-table
+        # LOCATION) so the mainframe->Oracle copy is one connected chain
+        self._bridge_ftp_remote_alias(combined)
         # DFSORT/SyncSort control cards -> column lineage; needs the record
         # layouts that cross-linking just placed on the physical FILE nodes
         resolve_sort_columns(combined)
@@ -191,6 +196,130 @@ class ParserOrchestrator:
                 reason="unload SELECT list and reader FD cannot be aligned "
                        "deterministically (count mismatch or non-contiguous "
                        "record layout)"))
+
+    # ------------------------------------------------------------------
+    def _bridge_ftp_remote_alias(self, result: ParseResult) -> None:
+        """An FTP ``put <dsn> <remote>`` whose remote name carries a
+        submission-time symbolic (``CR_ACX_VALID_&DATE..dat``) is a
+        deterministic record copy with one unknown - the symbol.  The JCL
+        parser emitted the transfer to a *template* node (``CR_ACX_VALID_*.DAT``)
+        and flagged it.  A downstream consumer already names the concrete file
+        - an Oracle external-table ``LOCATION ('CR_ACX_VALID_20260622.dat')``.
+        A unique match resolves the symbol, unifies the two file identities
+        into the concrete node, carries the source dataset's record schema
+        across the (byte-identity) copy, and retires the flag.  No / ambiguous
+        match -> the template stays flagged for the AI layer.
+        """
+        templates = [n for n in result.nodes if n.kind == NodeKind.FILE
+                     and n.attributes.get("ftp_unresolved")]
+        if not templates:
+            return
+        concrete = [n for n in result.nodes if n.kind == NodeKind.FILE
+                    and "*" not in n.id and not n.attributes.get("ftp_unresolved")]
+        for tmpl in templates:
+            rx = re.compile("^" + re.escape(tmpl.name).replace(r"\*", "(.+)") + "$")
+            matches = [(n, m) for n in concrete if (m := rx.match(n.name))]
+            if len(matches) != 1:
+                continue                  # absent / ambiguous -> stays flagged
+            target, m = matches[0]
+            resolved = dict(zip(tmpl.attributes.get("ftp_symbols") or [], m.groups()))
+            self._absorb_file_node(result, tmpl, target)
+            self._carry_ftp_record_copy(
+                result, tmpl.attributes.get("ftp_source"), target, resolved)
+            snippet = (f"put '{tmpl.attributes.get('ftp_source')}' "
+                       f"{tmpl.attributes.get('ftp_template')}")
+            result.dynamic_constructs = [
+                d for d in result.dynamic_constructs if d.snippet != snippet]
+
+    @staticmethod
+    def _absorb_file_node(result: ParseResult, src: EntityNode,
+                          dst: EntityNode) -> None:
+        """Merge file node ``src`` into ``dst``: re-point every edge and column
+        ref, fold in attributes, and drop ``src``."""
+        old, new = src.id, dst.id
+        for e in result.edges:
+            if e.source_id == old:
+                e.source_id = new
+            if e.target_id == old:
+                e.target_id = new
+            for cm in e.column_mappings:
+                cm.source_columns = [c.replace(f"{old}|", f"{new}|")
+                                     for c in cm.source_columns]
+                if cm.target_column.startswith(f"{old}|"):
+                    cm.target_column = f"{new}|{cm.target_column.split('|', 1)[1]}"
+        for k, v in src.attributes.items():
+            dst.attributes.setdefault(k, v)
+        dst.attributes.pop("ftp_unresolved", None)
+        result.nodes = [n for n in result.nodes if n.id != old]
+
+    @staticmethod
+    def _carry_ftp_record_copy(result: ParseResult, source_name: str | None,
+                               target: EntityNode, resolved: dict) -> None:
+        """FTP is a byte-identity copy: give the remote file the source
+        dataset's record schema and emit field-by-field identity column
+        lineage on the transfer edge, recording the resolved symbol."""
+        # the JCL parser clobbers the per-put transformation with the whole
+        # INPUT deck (flush_sysin), so match the transfer edge by endpoint
+        edge = next((e for e in result.edges
+                     if e.target_id == target.id
+                     and e.edge_type == EdgeType.WRITES_TO), None)
+        if edge is not None:
+            note = (" " + ", ".join(f"&{k}={v}" for k, v in resolved.items())
+                    if resolved else "")
+            edge.transformation = ("FTP transfer (ascii, byte-identity record "
+                                   f"copy); remote name resolved from downstream "
+                                   f"consumer{note}")
+        if not source_name:
+            return
+        src_id = f"{NodeKind.FILE.value}:{source_name}".upper()
+        src = next((n for n in result.nodes if n.id == src_id), None)
+        if src is None or not src.columns or edge is None or edge.column_mappings:
+            return
+        if not target.columns:
+            # remote has no schema of its own: it IS the source record, so give
+            # it the source field names and field-by-field identity lineage
+            target.columns = list(src.columns)
+            if "record_layout" in src.attributes:
+                target.attributes.setdefault(
+                    "record_layout", src.attributes["record_layout"])
+            edge.column_mappings = [
+                ColumnMapping(source_columns=[f"{src.id}|{f}"],
+                              target_column=f"{target.id}|{f}",
+                              transformation="FTP record copy (byte-identity)")
+                for f in src.columns]
+        elif src.attributes.get("record_layout") and target.attributes.get("record_layout"):
+            # remote carries its own schema under different names (e.g. an
+            # Oracle external table's positional columns), but it is the same
+            # physical record.  Pair by BYTE START POSITION - never by list
+            # order, which need not match the byte layout - so the rename is
+            # field-precise.  A target field with no source field at the same
+            # offset falls back to record-level (no guessing).
+            src_by_start = {f["start"]: f["field"]
+                            for f in src.attributes["record_layout"]}
+            cms = []
+            for tf in target.attributes["record_layout"]:
+                sf = src_by_start.get(tf["start"])
+                if sf:
+                    cms.append(ColumnMapping(
+                        source_columns=[f"{src.id}|{sf}"],
+                        target_column=f"{target.id}|{tf['field']}",
+                        transformation="FTP record copy (byte-identity; "
+                                       "renamed by downstream loader)"))
+                else:
+                    cms.append(ColumnMapping(
+                        source_columns=[f"{src.id}|*"],
+                        target_column=f"{target.id}|{tf['field']}",
+                        transformation="FTP record copy (record-level)"))
+            edge.column_mappings = cms
+        else:
+            # name sets differ and there is no byte layout to pair on (e.g. XML
+            # tags re-parsed from one text blob): assert record-level provenance
+            edge.column_mappings = [
+                ColumnMapping(source_columns=[f"{src.id}|*"],
+                              target_column=f"{target.id}|{tcol}",
+                              transformation="FTP record copy (record-level; "
+                                             "downstream re-parses the bytes)")
+                for tcol in target.columns]
 
     # ------------------------------------------------------------------
     def _reconcile_entity_edges(self, result: ParseResult) -> None:

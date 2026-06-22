@@ -522,7 +522,27 @@ class JclParser:
                 edge_type=EdgeType.READS_FROM, program=ftp_node.name,
                 evidence=f"FTP put '{local}'"))
             if "&" in remote:
-                # remote name depends on a submission-time symbol
+                # The remote name depends on a submission-time symbol (e.g.
+                # &DATE), but the transfer itself is a deterministic record
+                # copy.  Emit it to a *template* node (symbol -> '*') and flag
+                # the symbolic: the orchestrator reconciles the template against
+                # the concrete downstream filename (an Oracle external-table
+                # LOCATION), resolving the symbol and retiring the flag - the
+                # same flag-then-retire pattern as static CALL resolution.
+                template = _RE_SYMBOL.sub("*", remote).upper()
+                remote_node = EntityNode(
+                    kind=NodeKind.FILE, name=template,
+                    attributes={"transport": "FTP", "ftp_unresolved": True,
+                                "ftp_template": remote, "ftp_source": local,
+                                "ftp_symbols": [s.upper()
+                                                for s in _RE_SYMBOL.findall(remote)]})
+                result.nodes.append(remote_node)
+                result.edges.append(LineageEdge(
+                    source_id=ftp_node.id, target_id=remote_node.id,
+                    edge_type=EdgeType.WRITES_TO, program=ftp_node.name,
+                    transformation=f"FTP transfer (ascii, record copy); "
+                                   f"remote name {remote} (symbol unresolved)",
+                    evidence=f"put '{local}' {remote}"))
                 result.dynamic_constructs.append(DynamicConstruct(
                     program=ftp_node.name, language=self.language,
                     construct_type="JCL_SYMBOLIC",

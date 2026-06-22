@@ -78,6 +78,21 @@ def test_db2_cursor_column_lineage(result):
     assert "TRIM(A.EXTERNAL_ACCOUNT_NUMBER)" in cm.transformation
 
 
+def test_transform_steps_ordered_source_to_target(result):
+    """The transformation chain must be stored as ordered steps reading
+    source -> target (the SQL/host-var step that fills the host variable
+    BEFORE the COBOL MOVE that lands it in the output field), so the UI can
+    show every WS hop in flow order - not just a 'direct' / 'OPEN' line."""
+    edge = _edge(result, "PROGRAM:CRDB2EXT", EdgeType.WRITES_TO, CUST_EXTRACT)
+    cm = _mapping(edge, "CRA-EXTERNAL-ACCT-NUM")
+    assert cm.transform_steps == [
+        "TRIM(A.EXTERNAL_ACCOUNT_NUMBER)",
+        "MOVE HV-EXT-ACCT-NUM TO CRA-EXTERNAL-ACCT-NUM",
+    ]
+    # the joined string is the same content, same order
+    assert cm.transformation == "; ".join(cm.transform_steps)
+
+
 def test_conditional_move_merges_both_branches(result):
     """IF/ELSE MOVE: new-account number descends from DB2 txn AND the
     customer driving file (record-level)."""
@@ -149,12 +164,89 @@ def test_view_column_lineage(result):
 
 
 def test_only_known_constructs_flagged_nothing_guessed(result):
-    """Exactly two dynamic constructs estate-wide (FTP &DATE remote name +
-    the MI5021 month-partitioned dynamic INSERT); zero invented edges."""
+    """Only genuinely unresolvable constructs are flagged estate-wide.
+
+    The FTP `&DATE` remote names (MI4014's XML put and the four credit_risk_mart
+    CRJXFER .dat puts) are deterministic byte-identity copies whose symbolic is
+    reconciled against the concrete filename a downstream Oracle external table
+    already names (`_bridge_ftp_remote_alias`) - so they are resolved, not
+    flagged. The only construct left for the AI layer is MI5021's
+    month-partitioned dynamic INSERT (`EXECUTE IMMEDIATE`)."""
     flagged = sorted((d.language, d.construct_type)
                      for d in result.dynamic_constructs)
-    assert flagged == [("COBOL", "DYNAMIC_SQL"), ("JCL", "JCL_SYMBOLIC")]
-    symbolic = next(d for d in result.dynamic_constructs
-                    if d.construct_type == "JCL_SYMBOLIC")
-    assert "&DATE" in symbolic.snippet
+    assert flagged == [("COBOL", "DYNAMIC_SQL")]
     assert all(e.provenance == Provenance.DETERMINISTIC for e in result.edges)
+
+
+def test_group_move_record_copy_column_lineage(result):
+    """`MOVE EMP-FEED-REC TO EMP-VALID-REC` is a whole-record copy (both FD
+    records expand the same copybook): it must produce field-by-field identity
+    lineage from the feed file to the valid file, not a disconnected box."""
+    edge = _edge(result, "PROGRAM:CEMPDQA", EdgeType.WRITES_TO,
+                 "FILE:CRDM.EMP.VALID.DAT")
+    assert edge is not None and edge.column_mappings
+    cm = _mapping(edge, "EMD-EMP-ID")
+    assert cm.source_columns == ["FILE:CRDM.EMP.PROCESSED.FEED|EMD-EMP-ID"]
+    assert "group move" in cm.transformation.lower()
+
+
+def test_ftp_symbolic_reconciled_to_oracle_file(result):
+    """FTP `put <dsn> CR_ACX_VALID_&DATE..dat` is reconciled against the Oracle
+    external-table LOCATION `CR_ACX_VALID_20260622.dat`: the symbolic remote and
+    the concrete file are one node, &DATE is resolved, and the mainframe->Oracle
+    copy is a single connected chain with byte-identity column lineage."""
+    ids = {n.id for n in result.nodes}
+    resolved = "FILE:CR_ACX_VALID_20260622.DAT"
+    assert resolved in ids
+    # no wildcard / double-prefixed fragments survive
+    assert not any("*" in i or i.count("FILE:") > 1 for i in ids)
+    # deterministic FTP transfer edge: byte-identity copy paired field-for-field
+    # by byte position onto the remote's own (Oracle) column names
+    ftp = _edge(result, "PROGRAM:FTP.STEP010", EdgeType.WRITES_TO, resolved)
+    assert ftp is not None and ftp.provenance == Provenance.DETERMINISTIC
+    assert any(m.source_columns == ["FILE:CRDM.ACX.VALID.DAT|AXD-ACCOUNT-NUMBER"]
+               and m.target_column == f"{resolved}|ACCOUNT_NUMBER"
+               for m in ftp.column_mappings)
+    # chain continues into the Oracle loader
+    assert _edge(result, resolved, EdgeType.READS_FROM,
+                 "PROGRAM:ORACLE_LOADER.ACCOUNT_EXPOSURE_EXT") is not None
+
+
+def test_positional_external_table_column_lineage(result):
+    """An ORACLE_LOADER external table with fixed POSITION fields must map the
+    loader file's columns to the table columns (not just XML ENCLOSED BY), so
+    the mainframe->Oracle chain stays column-connected through staging."""
+    loader = "PROGRAM:ORACLE_LOADER.ACCOUNT_EXPOSURE_EXT"
+    edge = _edge(result, loader, EdgeType.WRITES_TO,
+                 "TABLE:CR_STAGE.ACCOUNT_EXPOSURE_EXT")
+    assert edge is not None and len(edge.column_mappings) == 11
+    cm = _mapping(edge, "ACCOUNT_NUMBER")
+    assert cm.source_columns == ["FILE:CR_ACX_VALID_20260622.DAT|ACCOUNT_NUMBER"]
+    assert "POSITION(1:8)" in cm.transformation
+
+
+def test_end_to_end_column_chain_mainframe_to_oracle_mart(result):
+    """One DB2 column is traceable, hop by hop, from the source table through
+    COBOL, the FTP transfer, the Oracle external table and staging, into the
+    final mart - across all three languages with no break."""
+    def col_targets(src):
+        return {m.target_column for e in result.edges
+                for m in e.column_mappings if src in m.source_columns}
+    hops = [
+        ("TABLE:CRDB2.ACCOUNT_EXPOSURE|ACCOUNT_NUMBER",
+         "FILE:CRDM.ACX.PROCESSED.FEED|AXD-ACCOUNT-NUMBER"),
+        ("FILE:CRDM.ACX.PROCESSED.FEED|AXD-ACCOUNT-NUMBER",
+         "FILE:CRDM.ACX.VALID.DAT|AXD-ACCOUNT-NUMBER"),
+        ("FILE:CRDM.ACX.VALID.DAT|AXD-ACCOUNT-NUMBER",
+         "FILE:CR_ACX_VALID_20260622.DAT|ACCOUNT_NUMBER"),
+        ("FILE:CR_ACX_VALID_20260622.DAT|ACCOUNT_NUMBER",
+         "TABLE:CR_STAGE.ACCOUNT_EXPOSURE_EXT|ACCOUNT_NUMBER"),
+        ("TABLE:CR_STAGE.ACCOUNT_EXPOSURE_EXT|ACCOUNT_NUMBER",
+         "TABLE:CR_STAGE.ACCOUNT_EXPOSURE_STG|ACCOUNT_NUMBER_STG"),
+        ("TABLE:CR_STAGE.ACCOUNT_EXPOSURE_STG|ACCOUNT_NUMBER_STG",
+         "TABLE:CR_MART.TMP_ACCOUNT_EXPOSURE|ACCOUNT_NUMBER"),
+        ("TABLE:CR_MART.TMP_ACCOUNT_EXPOSURE|ACCOUNT_NUMBER",
+         "TABLE:CR_MART.CREDIT_RISK_MODEL|ACCOUNT_NUMBER"),
+    ]
+    for src, nxt in hops:
+        assert nxt in col_targets(src), f"broken hop: {src} -> {nxt}"

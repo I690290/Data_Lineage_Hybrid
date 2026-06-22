@@ -85,6 +85,22 @@ def _named(value) -> bool:
     return bool(value) and str(value).strip().lower() not in _PLACEHOLDER_NAMES
 
 
+_KIND_PREFIXES = tuple(f"{k.value.upper()}:" for k in NodeKind)
+
+
+def _strip_kind_prefix(name: str) -> str:
+    """Drop a leading ``Kind:`` the model may have echoed into an entity name
+    (e.g. ``FILE:CR_ACX_VALID_*``); the emit step re-derives it from
+    ``EntityNode.id``, so leaving it would double-prefix to ``FILE:FILE:...``
+    and split one entity into two nodes."""
+    s = str(name).strip()
+    up = s.upper()
+    for pfx in _KIND_PREFIXES:
+        if up.startswith(pfx):
+            return s[len(pfx):]
+    return s
+
+
 class EdgeResolver:
     def __init__(self, provider: AIProvider, threshold: float):
         self._provider = provider
@@ -134,6 +150,9 @@ class EdgeResolver:
         for prop in proposals:
             # malformed / duplicate proposals never reach the judge
             edge_type_raw = prop.get("edge_type", "WRITES_TO")
+            for fld in ("source_entity", "target_entity"):
+                if _named(prop.get(fld)):
+                    prop[fld] = _strip_kind_prefix(prop[fld])
             anchor = (prop.get("target_entity") if edge_type_raw == "WRITES_TO"
                       else prop.get("source_entity"))
             if edge_type_raw not in ("READS_FROM", "WRITES_TO") or not _named(anchor):

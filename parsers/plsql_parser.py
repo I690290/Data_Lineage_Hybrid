@@ -68,6 +68,9 @@ _RE_CREATE_VIEW = re.compile(
 _RE_LOCATION = re.compile(r"LOCATION\s*\(\s*'([^']+)'", re.I)
 _RE_ENCLOSED = re.compile(
     r"([A-Z0-9_]+)\s+CHAR\s*\(\d+\)\s*ENCLOSED\s+BY\s+'<([^>']+)>'", re.I)
+_RE_POSITION = re.compile(
+    r"([A-Z0-9_]+)\s+POSITION\s*\(\s*(\d+)\s*:\s*(\d+)\s*\)", re.I)
+_RE_DIRECTORY = re.compile(r"DEFAULT\s+DIRECTORY\s+\"?([A-Z0-9_]+)\"?", re.I)
 _RE_COL_DEF = re.compile(rf"^\s*({_NAME})\s+", re.I)
 
 
@@ -189,15 +192,29 @@ class PlsqlParser:
                 self._handle_external_table(text, block_end, table_node, result, path)
 
     def _handle_external_table(self, text, org_pos, table_node, result, path) -> None:
-        """ORACLE_LOADER external table: file -> loader -> table mappings."""
-        tail = text[org_pos:]
+        """ORACLE_LOADER external table: file -> loader -> table mappings.
+
+        Two ACCESS PARAMETERS field styles are mapped deterministically:
+        * XML  ``col CHAR(n) ENCLOSED BY '<tag>'``  -> file tag -> table col.
+        * fixed/positional ``col POSITION(s:e) CHAR(n)`` -> the loader field
+          name is the table column name (one physical schema), and the byte
+          range gives the file node a record layout - so a feeding FTP copy
+          can be paired field-for-field instead of record-level.
+        """
+        stmt_end = text.find(";", org_pos)
+        tail = text[org_pos: stmt_end if stmt_end != -1 else len(text)]
         loc = _RE_LOCATION.search(tail)
         if not loc:
             return
-        xml_file = loc.group(1).upper()
+        data_file = loc.group(1).upper()
+        directory = (_RE_DIRECTORY.search(tail) or [None, ""])[1].upper()
+        enclosed = [(c, t) for c, t in _RE_ENCLOSED.findall(tail)
+                    if c.lower() != "delim"]
+        is_xml = bool(enclosed)
         file_node = EntityNode(
-            kind=NodeKind.FILE, name=xml_file,
-            attributes={"format": "XML", "directory": "NEPTUNE_FILES_LOAD"})
+            kind=NodeKind.FILE, name=data_file,
+            attributes={"format": "XML" if is_xml else "POSITIONAL",
+                        "directory": directory})
         result.nodes.append(file_node)
 
         loader = EntityNode(
@@ -207,24 +224,38 @@ class PlsqlParser:
             attributes={"object_type": "EXTERNAL_TABLE_LOADER"})
         result.nodes.append(loader)
 
-        mappings = []
-        for col, tag in _RE_ENCLOSED.findall(tail):
-            col = col.upper()
-            if col.lower() == "delim":
-                continue
-            file_node.columns.append(tag)
-            mappings.append(ColumnMapping(
-                source_columns=[f"{file_node.id}|{tag.upper()}"],
-                target_column=f"{table_node.id}|{col}",
-                transformation=f"XML tag <{tag}> ENCLOSED BY"))
+        mappings: list[ColumnMapping] = []
+        if is_xml:
+            for col, tag in enclosed:
+                file_node.columns.append(tag)
+                mappings.append(ColumnMapping(
+                    source_columns=[f"{file_node.id}|{tag.upper()}"],
+                    target_column=f"{table_node.id}|{col.upper()}",
+                    transformation=f"XML tag <{tag}> ENCLOSED BY"))
+            loader_logic = "ORACLE_LOADER: RECORDS DELIMITED BY '</Item>'"
+        else:
+            layout = []
+            for col, start, end in _RE_POSITION.findall(tail):
+                col, start, end = col.upper(), int(start), int(end)
+                file_node.columns.append(col)
+                layout.append({"field": col, "start": start,
+                               "length": end - start + 1})
+                mappings.append(ColumnMapping(
+                    source_columns=[f"{file_node.id}|{col}"],
+                    target_column=f"{table_node.id}|{col}",
+                    transformation=f"ORACLE_LOADER POSITION({start}:{end})"))
+            if layout:
+                file_node.attributes["record_layout"] = layout
+            loader_logic = "ORACLE_LOADER: RECORDS FIXED (positional)"
+
         result.edges.append(LineageEdge(
             source_id=file_node.id, target_id=loader.id,
             edge_type=EdgeType.READS_FROM, program=loader.name,
-            evidence=f"DEFAULT DIRECTORY NEPTUNE_FILES_LOAD LOCATION ('{xml_file}')"))
+            evidence=f"DEFAULT DIRECTORY {directory} LOCATION ('{data_file}')"))
         result.edges.append(LineageEdge(
             source_id=loader.id, target_id=table_node.id,
             edge_type=EdgeType.WRITES_TO, program=loader.name,
-            transformation="ORACLE_LOADER: RECORDS DELIMITED BY '</Item>'",
+            transformation=loader_logic,
             column_mappings=mappings,
             evidence=f"CREATE TABLE {table_node.name} ORGANIZATION EXTERNAL"))
 

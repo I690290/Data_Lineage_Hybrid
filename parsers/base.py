@@ -51,7 +51,11 @@ class ColumnMapping:
     """Column-level lineage: source column(s) -> target column."""
     source_columns: list[str]            # qualified "ENTITY.COLUMN"
     target_column: str                   # qualified "ENTITY.COLUMN"
-    transformation: str = "direct"       # logic captured as text
+    transformation: str = "direct"       # full logic as text (source->target)
+    # ordered transformation steps, source -> target (every WS/host-var hop,
+    # COMPUTE, STRING, TRIM, group move, ...). The frontend renders this as a
+    # step-by-step chain; ``transformation`` is the same content joined.
+    transform_steps: list[str] = field(default_factory=list)
 
 
 @dataclass

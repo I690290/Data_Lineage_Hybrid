@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from parsers import ParserOrchestrator
+from parsers.base import EdgeType
 from parsers.cobol_parser import CobolParser
 from parsers.jcl_parser import JclParser
 from parsers.plsql_parser import PlsqlParser
@@ -26,14 +27,28 @@ def _cobol(tmp_path: Path, body: str) -> Path:
     return path
 
 
-def test_mi4014_corpus_self_reports_unmapped_moves():
-    """The known gap: reference-modified CURRENT-DATE moves in all 3 programs."""
+def test_corpus_self_reports_unmapped_constructs():
+    """Estate-wide coverage telemetry is exactly the known, documented gaps:
+
+      - 3x COBOL_MOVE: reference-modified CURRENT-DATE(1:8) moves in the
+        three MI4014 extract/XML programs.
+      - 1x JCL_SORT_CONTROL: the credit_risk_mart CRJACX01 DFSORT JOINKEYS
+        whose enriched output (CRDM.ACX.ENRICHED.UNLOAD) has no recoverable
+        record layout, so the join cannot be mapped to columns.
+
+    No other movement-shaped statement is silently dropped."""
     result = ParserOrchestrator().parse_tree(SOURCE)
-    assert len(result.unparsed) == 3
-    assert {u.statement_type for u in result.unparsed} == {"COBOL_MOVE"}
-    assert all("CURRENT-DATE(1:8)" in u.snippet for u in result.unparsed)
-    assert {u.program for u in result.unparsed} == \
-        {"CRDB2EXT", "CRTXNEXT", "CRXMLGEN"}
+    assert len(result.unparsed) == 4
+
+    moves = [u for u in result.unparsed if u.statement_type == "COBOL_MOVE"]
+    assert len(moves) == 3
+    assert all("CURRENT-DATE(1:8)" in u.snippet for u in moves)
+    assert {u.program for u in moves} == {"CRDB2EXT", "CRTXNEXT", "CRXMLGEN"}
+
+    sort_gaps = [u for u in result.unparsed
+                 if u.statement_type == "JCL_SORT_CONTROL"]
+    assert len(sort_gaps) == 1
+    assert "no record layout" in sort_gaps[0].reason
 
 
 @pytest.mark.parametrize("statement,expected_type", [
@@ -69,6 +84,87 @@ def test_cobol_plain_moves_not_flagged(tmp_path):
         MOVE SPACES TO WS-OUT.
     """))
     assert result.unparsed == []
+
+
+def _cobol_program(tmp_path: Path, name: str, body: str) -> Path:
+    """Write a whole COBOL program in fixed format (code in area A/B at col 8+;
+    `_normalize` keeps only columns 8-72)."""
+    lines = textwrap.dedent(body).strip().splitlines()
+    path = tmp_path / f"{name}.cbl"
+    path.write_text("\n".join("       " + ln for ln in lines) + "\n")
+    return path
+
+
+def test_group_move_chains_through_ws_intermediary(tmp_path):
+    """Generic whole-record move: a record copied through a WORKING-STORAGE
+    intermediary (`READ INTO WS-REC` then `MOVE WS-REC TO OUT-REC`) must
+    resolve transitively, field-by-field, back to the input file - even though
+    the records use different field names (paired by byte offset, not name).
+    The narrow FD->FD-only handler could not see this; the generic one must."""
+    prog = _cobol_program(tmp_path, "GMWS", """
+        IDENTIFICATION DIVISION.
+        PROGRAM-ID. GMWS.
+        ENVIRONMENT DIVISION.
+        INPUT-OUTPUT SECTION.
+        FILE-CONTROL.
+            SELECT IN-FILE  ASSIGN TO INDD.
+            SELECT OUT-FILE ASSIGN TO OUTDD.
+        DATA DIVISION.
+        FILE SECTION.
+        FD  IN-FILE.
+        01  IN-REC.
+            05  IN-A   PIC X(5).
+            05  IN-B   PIC X(3).
+        FD  OUT-FILE.
+        01  OUT-REC.
+            05  OUT-A  PIC X(5).
+            05  OUT-B  PIC X(3).
+        WORKING-STORAGE SECTION.
+        01  WS-REC.
+            05  WS-A   PIC X(5).
+            05  WS-B   PIC X(3).
+        PROCEDURE DIVISION.
+        MAIN-PARA.
+            OPEN INPUT IN-FILE.
+            OPEN OUTPUT OUT-FILE.
+            READ IN-FILE INTO WS-REC.
+            MOVE WS-REC TO OUT-REC.
+            WRITE OUT-REC.
+    """)
+    result = CobolParser().parse(prog)
+    edge = next(e for e in result.edges
+                if e.edge_type == EdgeType.WRITES_TO and e.target_id == "FILE:OUTDD")
+    cols = {m.target_column.rsplit("|", 1)[-1]: m.source_columns
+            for m in edge.column_mappings}
+    # OUT-A/OUT-B trace back through WS-REC to the input file (record-level READ)
+    assert cols.get("OUT-A") == ["FILE:INDD|*"]
+    assert cols.get("OUT-B") == ["FILE:INDD|*"]
+    assert not [u for u in result.unparsed if u.statement_type == "COBOL_GROUP_MOVE"]
+
+
+def test_unalignable_group_move_flagged_not_dropped(tmp_path):
+    """A group move whose records cannot be aligned deterministically (OCCURS
+    breaks the byte layout and the field counts differ) must surface as
+    COVERAGE telemetry - never silently dropped, never guessed."""
+    prog = _cobol_program(tmp_path, "GMBAD", """
+        IDENTIFICATION DIVISION.
+        PROGRAM-ID. GMBAD.
+        DATA DIVISION.
+        WORKING-STORAGE SECTION.
+        01  SRC-REC.
+            05  S-A    PIC X(4).
+            05  S-B    PIC X(4).
+            05  S-C    REDEFINES S-B PIC X(4).
+        01  DST-REC.
+            05  D-A    PIC X(4).
+            05  D-B    PIC X(4).
+        PROCEDURE DIVISION.
+        MAIN-PARA.
+            MOVE SRC-REC TO DST-REC.
+    """)
+    result = CobolParser().parse(prog)
+    flagged = [u for u in result.unparsed if u.statement_type == "COBOL_GROUP_MOVE"]
+    assert len(flagged) == 1 and "SRC-REC" in flagged[0].snippet
 
 
 def test_jcl_detectors(tmp_path):

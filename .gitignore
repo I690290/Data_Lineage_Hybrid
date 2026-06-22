@@ -12,3 +12,5 @@ frontend/node_modules/
 .claude/
 
 CLAUDE.md
+
+graphify-out/

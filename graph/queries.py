@@ -16,6 +16,20 @@ def _attrs(raw: str | None) -> dict:
     except (TypeError, ValueError):
         return {}
 
+
+def _steps(raw: str | None, fallback: str | None = None) -> list[str]:
+    """Ordered transformation steps (source->target), stored as a JSON list.
+    Falls back to splitting the joined transformation string."""
+    try:
+        val = json.loads(raw) if raw else None
+        if isinstance(val, list) and val:
+            return val
+    except (TypeError, ValueError):
+        pass
+    if fallback and fallback != "direct":
+        return [s.strip() for s in fallback.split("; ") if s.strip()]
+    return []
+
 # TRANSFORMS_TO at entity level = view definitions (table -> view);
 # column-level TRANSFORMS_TO lives on Column nodes, unreachable from here.
 _ENTITY_RELS = "READS_FROM|WRITES_TO|EXECUTES|TRANSFORMS_TO"
@@ -121,6 +135,8 @@ class LineageRepository:
                     "source_column": s["name"], "target_column": t["name"],
                     "program": r.get("program"),
                     "transformation": r.get("transformation"),
+                    "transform_steps": _steps(r.get("transform_steps"),
+                                              r.get("transformation")),
                     "provenance": r.get("provenance", "DETERMINISTIC"),
                     "status": r.get("status", "CONFIRMED"),
                     "confidence": r.get("confidence", 1.0),

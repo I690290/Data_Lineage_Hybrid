@@ -66,6 +66,11 @@ function TransformationPanel({ edge, onClose }) {
   const code = data.transformation || '';
   const lang = detectLang(code);
   const [copied, setCopied] = useState(false);
+  // ordered transformation chain (source -> target); fall back to splitting
+  // the joined string so older data still renders as steps
+  const steps = (data.transform_steps && data.transform_steps.length)
+    ? data.transform_steps
+    : (code && code !== 'direct' ? code.split('; ').filter(Boolean) : []);
 
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(code).then(() => {
@@ -137,7 +142,21 @@ function TransformationPanel({ edge, onClose }) {
         </div>
       )}
 
-      {/* ── transformation code ── */}
+      {/* ── transformation chain (ordered source -> target) ── */}
+      {steps.length > 1 && (
+        <div className="panel-section">
+          <div className="panel-section-title">
+            Transformation chain ({steps.length} steps, source → target)
+          </div>
+          <ol className="panel-steps">
+            {steps.map((s, i) => (
+              <li key={i} className="panel-step"><code>{s}</code></li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      {/* ── transformation code (full, copyable) ── */}
       {code && (
         <div className="panel-section panel-code-section">
           <div className="panel-code-header">
