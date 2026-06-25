@@ -4,6 +4,8 @@
 -- PURPOSE : Staging table DDL + load procedure. Reads
 --           ACCOUNT_EXPOSURE_EXT and loads ACCOUNT_EXPOSURE_STG.
 --           CUST_ID mutates to CUSTOMER_ID_STG (join key to customer).
+--           Carries the EAD / LGD / PD / Expected-Loss metrics and
+--           derives a Basel exposure risk band from the PD rate.
 -- ================================================================
 
 CREATE TABLE "CR_STAGE"."ACCOUNT_EXPOSURE_STG"
@@ -19,6 +21,13 @@ CREATE TABLE "CR_STAGE"."ACCOUNT_EXPOSURE_STG"
     UTILISATION_PCT_STG    NUMBER(5,2),
     ARREARS_DAYS_STG       NUMBER(5),
     DEFAULT_FLAG_STG       VARCHAR2(1),
+    EAD_GBP_STG            NUMBER(15,2),
+    LGD_BASE_RATE_STG      NUMBER(7,4),
+    FINAL_LGD_STG          NUMBER(7,4),
+    PD_RATE_STG            NUMBER(7,4),
+    RISK_STATUS_STG        VARCHAR2(8),
+    EXPECTED_LOSS_GBP_STG  NUMBER(15,2),
+    EXPOSURE_RISK_BAND_STG VARCHAR2(12),
     LOAD_DATE              DATE DEFAULT SYSDATE
 );
 
@@ -30,7 +39,9 @@ BEGIN
         ACCOUNT_NUMBER_STG, SORT_CODE_STG, CUSTOMER_ID_STG,
         PRODUCT_CODE_STG, BALANCE_GBP_STG, CREDIT_LIMIT_GBP_STG,
         COLLATERAL_GBP_STG, NET_EXPOSURE_GBP_STG, UTILISATION_PCT_STG,
-        ARREARS_DAYS_STG, DEFAULT_FLAG_STG, LOAD_DATE
+        ARREARS_DAYS_STG, DEFAULT_FLAG_STG, EAD_GBP_STG,
+        LGD_BASE_RATE_STG, FINAL_LGD_STG, PD_RATE_STG, RISK_STATUS_STG,
+        EXPECTED_LOSS_GBP_STG, EXPOSURE_RISK_BAND_STG, LOAD_DATE
     )
     SELECT
         TRIM(e.ACCOUNT_NUMBER)                AS ACCOUNT_NUMBER_STG,
@@ -44,6 +55,18 @@ BEGIN
         TO_NUMBER(TRIM(e.UTILISATION_PCT))    AS UTILISATION_PCT_STG,
         TO_NUMBER(TRIM(e.ARREARS_DAYS))       AS ARREARS_DAYS_STG,
         TRIM(e.DEFAULT_FLAG)                  AS DEFAULT_FLAG_STG,
+        TO_NUMBER(TRIM(e.EAD_GBP))            AS EAD_GBP_STG,
+        TO_NUMBER(TRIM(e.LGD_BASE_RATE))      AS LGD_BASE_RATE_STG,
+        TO_NUMBER(TRIM(e.FINAL_LGD))          AS FINAL_LGD_STG,
+        TO_NUMBER(TRIM(e.PD_RATE))            AS PD_RATE_STG,
+        TRIM(e.RISK_STATUS)                   AS RISK_STATUS_STG,
+        TO_NUMBER(TRIM(e.EXPECTED_LOSS_GBP))  AS EXPECTED_LOSS_GBP_STG,
+        CASE
+            WHEN TO_NUMBER(TRIM(e.PD_RATE)) >= 1.0  THEN 'DEFAULTED'
+            WHEN TO_NUMBER(TRIM(e.PD_RATE)) >= 0.15 THEN 'SUBSTANDARD'
+            WHEN TO_NUMBER(TRIM(e.PD_RATE)) >= 0.05 THEN 'WATCH'
+            ELSE 'PERFORMING'
+        END                                   AS EXPOSURE_RISK_BAND_STG,
         SYSDATE                               AS LOAD_DATE
     FROM "CR_STAGE"."ACCOUNT_EXPOSURE_EXT" e
     WHERE TRIM(e.ACCOUNT_NUMBER) IS NOT NULL;

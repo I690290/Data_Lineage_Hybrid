@@ -153,6 +153,8 @@ def _parse_cards(cards: list[str]) -> dict:
                   "sort": None, "rebuilds": [], "outfil_dd": None,
                   "include": None}
     for stmt in _join_continuations(cards):
+        if stmt.lstrip().startswith("*"):
+            continue                          # DFSORT comment line
         op = stmt.split()[0].upper() if stmt.split() else ""
         operands = stmt[len(op):].replace(" ", "")
         if op == "JOINKEYS":

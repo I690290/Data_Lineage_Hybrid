@@ -52,7 +52,8 @@ _RE_MOVE = re.compile(
     r"\bMOVE\s+(?:FUNCTION\s+[A-Z0-9-]+\s*\(\s*)*"
     r"(?:FUNCTION\s+[A-Z0-9-]+\s*\(\s*)*([A-Z0-9-]+)[\s)]*\s+TO\s+([A-Z0-9-]+)", re.I)
 _RE_COMPUTE = re.compile(
-    r"\bCOMPUTE\s+([A-Z0-9-]+)\s*=\s*(.+?)(?=\bEND-COMPUTE\b|\.(?:\s|$))", re.I | re.S)
+    r"\bCOMPUTE\s+([A-Z0-9-]+)(?:\s+ROUNDED)?\s*=\s*(.+?)"
+    r"(?=\bEND-COMPUTE\b|\bON\s+SIZE\b|\.(?:\s|$))", re.I | re.S)
 _RE_STRING = re.compile(r"\bSTRING\s+(.+?)\bINTO\s+([A-Z0-9-]+)", re.I | re.S)
 _RE_READ_INTO = re.compile(r"\bREAD\s+([A-Z0-9-]+)\s+INTO\s+([A-Z0-9-]+)", re.I)
 _RE_EXEC_SQL = re.compile(r"EXEC\s+SQL(.*?)END-EXEC", re.I | re.S)
@@ -68,6 +69,33 @@ _RE_STATIC_CALL = re.compile(
 _RE_PROC_USING = re.compile(
     r"PROCEDURE\s+DIVISION\s+USING\s+([A-Z0-9-\s,]+?)\s*\.", re.I)
 _CALL_ARG_NOISE = {"BY", "REFERENCE", "CONTENT", "VALUE"}
+
+# Arithmetic ... GIVING <target>: ADD/SUBTRACT/MULTIPLY/DIVIDE accumulate the
+# operand identifiers as sources of the GIVING target (same contract as COMPUTE).
+_RE_ARITH_GIVING = re.compile(
+    r"\b(ADD|SUBTRACT|MULTIPLY|DIVIDE)\s+(.+?)\s+GIVING\s+(.+?)"
+    r"(?=\bREMAINDER\b|\bON\s+SIZE\b|\bNOT\s+ON\b"
+    r"|\bEND-(?:ADD|SUBTRACT|MULTIPLY|DIVIDE)\b|\.(?:\s|$))", re.I | re.S)
+_ARITH_NOISE = {"TO", "BY", "INTO", "FROM", "GIVING", "ROUNDED", "REMAINDER"}
+
+# EVALUATE conditional bucketing and SEARCH/SEARCH ALL table lookups: the
+# variables driving the decision (the EVALUATE subject + WHEN conditions, or the
+# SEARCH key argument) become sources of every value the branch assigns - so the
+# bucket / looked-up output traces back to the column that selected it.
+_RE_EVALUATE = re.compile(r"\bEVALUATE\b(.+?)\bEND-EVALUATE\b", re.I | re.S)
+_RE_SEARCH = re.compile(
+    r"\bSEARCH\s+(?:ALL\s+)?([A-Z0-9-]+)(.+?)\bEND-SEARCH\b", re.I | re.S)
+_RE_WHEN = re.compile(r"\bWHEN\b(.+?)(?=\bWHEN\b|$)", re.I | re.S)
+_RE_MOVE_TO_TARGET = re.compile(r"\bMOVE\b.+?\bTO\s+([A-Z0-9-]+)", re.I | re.S)
+_RE_MOVE_SUBSCRIPTED = re.compile(
+    r"\bMOVE\s+([A-Z0-9-]+)\s*\([^)]*\)\s*TO\s+([A-Z0-9-]+)", re.I)
+_RE_COMPUTE_TARGET = re.compile(r"\bCOMPUTE\s+([A-Z0-9-]+)", re.I)
+_RE_SEARCH_ARG = re.compile(r"\bWHEN\b[^=<>]*?[=<>]\s*([A-Z][A-Z0-9-]*)", re.I)
+_RE_BRANCH_VERB = re.compile(
+    r"\b(MOVE|COMPUTE|PERFORM|CONTINUE|SET|ADD|SUBTRACT|MULTIPLY|DIVIDE|GO|NEXT)\b",
+    re.I)
+_EVAL_NOISE = {"TRUE", "FALSE", "OTHER", "WHEN", "ALSO", "THRU", "THROUGH",
+               "AND", "OR", "NOT", "EVALUATE", "END-EVALUATE", "ANY"}
 
 _COBOL_KEYWORDS = {
     "MOVE", "TO", "COMPUTE", "STRING", "INTO", "DELIMITED", "BY", "SIZE",
@@ -172,9 +200,6 @@ _UNPARSED_DETECTORS: list[tuple[str, re.Pattern, str]] = [
     ("COBOL_MOVE_CORRESPONDING",
      re.compile(r"\bMOVE\s+CORR(?:ESPONDING)?\b[^.]*", re.I),
      "MOVE CORRESPONDING requires group-structure matching"),
-    ("COBOL_ARITHMETIC_GIVING",
-     re.compile(r"\b(?:ADD|SUBTRACT|MULTIPLY|DIVIDE)\b[^.]*?\bGIVING\s+[A-Z0-9-]+", re.I | re.S),
-     "arithmetic GIVING transform is not captured"),
     ("COBOL_WRITE_FROM",
      re.compile(r"\bWRITE\s+[A-Z0-9-]+\s+FROM\s+[A-Z0-9-]+", re.I),
      "WRITE ... FROM record movement is not traced"),
@@ -235,10 +260,14 @@ class CobolParser:
         records = self._parse_record_layouts(lines)
         self._expand_group_moves(text, records, file_nodes, {},
                                  transforms, program, result)
+        # EVALUATE bucketing / SEARCH lookups: decision drivers -> branch
+        # outputs (and the spans they consume, so telemetry does not re-flag
+        # the literal / subscripted MOVEs inside them)
+        conditional_spans = self._parse_conditionals(text, transforms)
         ws_literals = self._parse_ws_literals(lines)
         self._parse_exec_sql(lines, text, program, program_node, field_owner,
                              transforms, ws_literals, result)
-        self._detect_unparsed(lines, text, program, result)
+        self._detect_unparsed(lines, text, program, result, conditional_spans)
 
         # --- entity edges + column mappings for OUTPUT files --------------
         output_edges: list[tuple[LineageEdge, EntityNode]] = []
@@ -284,7 +313,7 @@ class CobolParser:
             mappings.append(ColumnMapping(
                 source_columns=sources,
                 target_column=f"{node.id}|{field}",
-                transformation=("; ".join(steps) or "direct")[:600],
+                transformation=("; ".join(steps) or "direct")[:1000],
                 transform_steps=steps))
         return mappings
 
@@ -380,6 +409,12 @@ class CobolParser:
             src_owner = self._record_entity_id(records[s], file_nodes, fd_to_logical)
             for sf, tf in pairs:
                 src_ref = f"{src_owner}|{sf}" if src_owner else sf
+                # an internal self-named pass-through (WS<->LINKAGE copy of the
+                # same copybook, e.g. the MVC comm area) neither introduces a
+                # source nor renames a field - it carries no lineage and only
+                # adds noise to every field's transform chain, so skip it.
+                if src_ref == tf:
+                    continue
                 self._add_transform(
                     transforms, tf, [src_ref],
                     f"group move: MOVE {s} TO {t} (whole-record copy)")
@@ -473,7 +508,7 @@ class CobolParser:
                         logic = (f"CALL '{call['callee']}' USING {arg}->{param}: "
                                  + ("; ".join(dict.fromkeys(logics)) or "direct"))
                         self._add_transform(art["transforms"], child,
-                                            sources, logic[:400])
+                                            sources, logic[:800])
                         injected += 1
 
                 if injected:
@@ -622,6 +657,18 @@ class CobolParser:
                     if i.upper() not in _COBOL_KEYWORDS]
             self._add_transform(transforms, tgt, srcs,
                                 f"STRING {' '.join(body.split())} INTO {tgt.upper()}")
+        # ADD/SUBTRACT/MULTIPLY/DIVIDE ... GIVING <target(s)>: operand fields
+        # are the sources of each GIVING target (same contract as COMPUTE).
+        for verb, operands, targets in _RE_ARITH_GIVING.findall(text):
+            srcs = [i.upper() for i in _RE_IDENT.findall(_strip_literals(operands))
+                    if i.upper() not in _COBOL_KEYWORDS
+                    and i.upper() not in _ARITH_NOISE]
+            tgts = [t.upper() for t in _RE_IDENT.findall(targets)
+                    if t.upper() not in _ARITH_NOISE]
+            logic = (f"{verb.upper()} {' '.join(operands.split())} "
+                     f"GIVING {' '.join(targets.split())}")
+            for tgt in tgts:
+                self._add_transform(transforms, tgt, srcs, logic)
         # READ <file> INTO <ws-group>: record-level lineage - every child of
         # the group descends from the input file (no positional guessing).
         for logical, group in _RE_READ_INTO.findall(text):
@@ -633,6 +680,78 @@ class CobolParser:
             for child in ws_groups.get(group.upper(), []):
                 self._add_transform(transforms, child, [token], logic)
         return transforms
+
+    @staticmethod
+    def _cond_idents(fragment: str) -> list[str]:
+        """Field identifiers participating in a condition (literals, COBOL
+        keywords and EVALUATE/relational noise removed)."""
+        return [i.upper() for i in _RE_IDENT.findall(_strip_literals(fragment))
+                if i.upper() not in _COBOL_KEYWORDS
+                and i.upper() not in _EVAL_NOISE]
+
+    def _parse_conditionals(self, text: str, transforms: dict) -> list[tuple[int, int]]:
+        """EVALUATE bucketing + SEARCH/SEARCH ALL lookups -> column lineage.
+
+        The decision drivers (EVALUATE subject + WHEN conditions, or the SEARCH
+        key argument) become sources of every value assigned inside the branch,
+        so a bucketed status / looked-up rate traces back to the field that
+        selected it - even when the assigned value itself is a literal or a
+        subscripted table cell the elementary transform engine cannot follow.
+
+        Returns the character spans consumed, so ``_detect_unparsed`` does not
+        re-flag the literal / reference-modified / subscripted MOVEs inside them.
+        """
+        spans: list[tuple[int, int]] = []
+
+        # ---- EVALUATE ... END-EVALUATE ------------------------------------
+        for ev in _RE_EVALUATE.finditer(text):
+            spans.append(ev.span())
+            block = ev.group(1)
+            head = re.split(r"\bWHEN\b", block, maxsplit=1, flags=re.I)[0]
+            drivers = self._cond_idents(head)
+            for wm in _RE_WHEN.finditer(block):
+                vb = _RE_BRANCH_VERB.search(wm.group(1))
+                cond = wm.group(1)[:vb.start()] if vb else wm.group(1)
+                drivers.extend(self._cond_idents(cond))
+            drivers = list(dict.fromkeys(drivers))
+            if not drivers:
+                continue
+            targets = {m.group(1).upper()
+                       for m in _RE_MOVE_TO_TARGET.finditer(block)}
+            targets |= {m.group(1).upper()
+                        for m in _RE_COMPUTE_TARGET.finditer(block)}
+            logic = f"EVALUATE bucketing on {', '.join(drivers)}"
+            for tgt in targets:
+                self._add_transform(transforms, tgt, drivers, logic)
+
+        # ---- SEARCH / SEARCH ALL ... END-SEARCH ---------------------------
+        for sm in _RE_SEARCH.finditer(text):
+            spans.append(sm.span())
+            table, body = sm.group(1).upper(), sm.group(2)
+            args = list(dict.fromkeys(a.upper() for a in _RE_SEARCH_ARG.findall(body)))
+            done: set[str] = set()
+            # MOVE table-value(idx) TO target: the lookup result + its key driver
+            for valfield, tgt in _RE_MOVE_SUBSCRIPTED.findall(body):
+                tgt = tgt.upper()
+                srcs = list(dict.fromkeys(args + [valfield.upper()]))
+                self._add_transform(
+                    transforms, tgt, srcs,
+                    f"SEARCH ALL {table}: lookup {valfield.upper()} keyed on "
+                    f"{', '.join(args) or 'index'}")
+                done.add(tgt)
+            if not args:
+                continue
+            # remaining branch assignments (e.g. AT END default) trace to the key
+            for m in _RE_MOVE_TO_TARGET.finditer(body):
+                tgt = m.group(1).upper()
+                if tgt not in done:
+                    self._add_transform(transforms, tgt, args,
+                                        f"SEARCH ALL {table}: default keyed on "
+                                        f"{', '.join(args)}")
+            for m in _RE_COMPUTE_TARGET.finditer(body):
+                self._add_transform(transforms, m.group(1).upper(), args,
+                                    f"SEARCH ALL {table} keyed on {', '.join(args)}")
+        return spans
 
     def _resolve(self, var: str, transforms: dict, field_owner: dict,
                  depth: int = 0, seen: frozenset = frozenset()) -> tuple[list[str], list[str]]:
@@ -760,16 +879,27 @@ class CobolParser:
                 reason=f"embedded SQL verb '{verb}' is not mapped to lineage"))
 
     # ------------------------------------------------------------------
-    def _detect_unparsed(self, lines, text, program, result: ParseResult) -> None:
-        """Flag data-movement-shaped statements the transform engine skipped."""
+    def _detect_unparsed(self, lines, text, program, result: ParseResult,
+                         skip_spans: list[tuple[int, int]] | None = None) -> None:
+        """Flag data-movement-shaped statements the transform engine skipped.
+
+        ``skip_spans`` are EVALUATE/SEARCH blocks already resolved to lineage
+        by ``_parse_conditionals``; MOVEs inside them (literal buckets,
+        subscripted lookups) are mapped, not gaps, so they are not re-flagged.
+        """
         blanked = _blank_literals(text)
+        skip_spans = skip_spans or []
+
+        def in_skip(pos: int) -> bool:
+            return any(s <= pos < e for s, e in skip_spans)
 
         # MOVEs the transform regex could not parse (e.g. reference
         # modification: MOVE FUNCTION CURRENT-DATE(1:8) TO WS-DATE)
         matched_moves = {m.start() for m in _RE_MOVE.finditer(blanked)}
         for m in re.finditer(r"\bMOVE\s+[^\s'][^']*?\s+TO\s+[A-Z0-9-]+",
                              blanked, re.I):
-            if m.start() in matched_moves or "CORR" in m.group(0).upper():
+            if m.start() in matched_moves or "CORR" in m.group(0).upper() \
+                    or in_skip(m.start()):
                 continue
             result.unparsed.append(UnparsedStatement(
                 program=program, language=self.language,
@@ -781,6 +911,8 @@ class CobolParser:
 
         for stype, pattern, reason in _UNPARSED_DETECTORS:
             for m in pattern.finditer(blanked):
+                if in_skip(m.start()):
+                    continue
                 result.unparsed.append(UnparsedStatement(
                     program=program, language=self.language,
                     statement_type=stype,

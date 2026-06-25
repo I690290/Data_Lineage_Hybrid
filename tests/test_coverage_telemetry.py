@@ -55,7 +55,6 @@ def test_corpus_self_reports_unmapped_constructs():
     ("CALL 'SUBPGM1' USING WS-AREA.", "COBOL_CALL"),
     ("UNSTRING WS-IN DELIMITED BY ',' INTO WS-A WS-B.", "COBOL_UNSTRING"),
     ("MOVE CORRESPONDING WS-GRP-A TO WS-GRP-B.", "COBOL_MOVE_CORRESPONDING"),
-    ("ADD WS-A WS-B GIVING WS-TOTAL.", "COBOL_ARITHMETIC_GIVING"),
     ("WRITE OUT-REC FROM WS-WORK-REC.", "COBOL_WRITE_FROM"),
     ("MOVE WS-FULL(1:8) TO WS-PART.", "COBOL_MOVE"),
 ])
@@ -63,6 +62,152 @@ def test_cobol_detectors(tmp_path, statement, expected_type):
     result = CobolParser().parse(_cobol(tmp_path, statement))
     assert expected_type in {u.statement_type for u in result.unparsed}, \
         f"{statement!r} should be flagged as {expected_type}"
+
+
+def _whole_program(tmp_path: Path, name: str, body: str):
+    prog = "\n".join("       " + ln for ln in textwrap.dedent(body).strip().splitlines())
+    path = tmp_path / f"{name}.cbl"
+    path.write_text(prog + "\n")
+    return CobolParser().parse(path)
+
+
+def test_arithmetic_giving_mapped(tmp_path):
+    """ADD/SUBTRACT/MULTIPLY/DIVIDE ... GIVING is now a mapped transform (its
+    operands are the sources of the target), not coverage telemetry."""
+    result = _whole_program(tmp_path, "ARITHPGM", """
+        IDENTIFICATION DIVISION.
+        PROGRAM-ID. ARITHPGM.
+        ENVIRONMENT DIVISION.
+        INPUT-OUTPUT SECTION.
+        FILE-CONTROL.
+            SELECT IN-FILE  ASSIGN TO INDD.
+            SELECT OUT-FILE ASSIGN TO OUTDD.
+        DATA DIVISION.
+        FILE SECTION.
+        FD  IN-FILE.
+        01  IN-REC.
+            05  IN-A  PIC 9(4).
+            05  IN-B  PIC 9(4).
+        FD  OUT-FILE.
+        01  OUT-REC.
+            05  OUT-TOTAL  PIC 9(6).
+        PROCEDURE DIVISION.
+        MAIN-PARA.
+            OPEN INPUT IN-FILE.
+            OPEN OUTPUT OUT-FILE.
+            ADD IN-A IN-B GIVING OUT-TOTAL.
+            WRITE OUT-REC.
+    """)
+    assert not [u for u in result.unparsed
+                if u.statement_type == "COBOL_ARITHMETIC_GIVING"]
+    edge = next(e for e in result.edges
+                if e.edge_type == EdgeType.WRITES_TO and e.target_id == "FILE:OUTDD")
+    cm = next(m for m in edge.column_mappings
+              if m.target_column.endswith("|OUT-TOTAL"))
+    assert set(cm.source_columns) == {"FILE:INDD|IN-A", "FILE:INDD|IN-B"}
+    assert "GIVING" in cm.transformation
+
+
+def test_evaluate_bucketing_mapped(tmp_path):
+    """EVALUATE risk-bucketing links the decision drivers (WHEN conditions) to
+    every value the branches assign - even literal MOVEs - and does not leave
+    those literal/decimal MOVEs as COBOL_MOVE telemetry."""
+    result = _whole_program(tmp_path, "PDPGM", """
+        IDENTIFICATION DIVISION.
+        PROGRAM-ID. PDPGM.
+        ENVIRONMENT DIVISION.
+        INPUT-OUTPUT SECTION.
+        FILE-CONTROL.
+            SELECT IN-FILE  ASSIGN TO INDD.
+            SELECT OUT-FILE ASSIGN TO OUTDD.
+        DATA DIVISION.
+        FILE SECTION.
+        FD  IN-FILE.
+        01  IN-REC.
+            05  IN-DPD     PIC 9(4).
+            05  IN-SCORE   PIC 9(4).
+        FD  OUT-FILE.
+        01  OUT-REC.
+            05  OUT-STATUS PIC X(8).
+            05  OUT-PD     PIC 9.9999.
+        PROCEDURE DIVISION.
+        MAIN-PARA.
+            OPEN INPUT IN-FILE.
+            OPEN OUTPUT OUT-FILE.
+            MOVE IN-DPD   TO WS-DPD.
+            EVALUATE TRUE
+                WHEN IN-DPD > 90
+                    MOVE 'DEFAULT' TO OUT-STATUS
+                    MOVE 1.0000    TO OUT-PD
+                WHEN IN-SCORE >= 750
+                    MOVE 'LOW'     TO OUT-STATUS
+                    MOVE 0.0100    TO OUT-PD
+                WHEN OTHER
+                    MOVE 'MEDIUM'  TO OUT-STATUS
+                    MOVE 0.0500    TO OUT-PD
+            END-EVALUATE.
+            WRITE OUT-REC.
+    """)
+    # the decimal-literal MOVEs inside the EVALUATE are mapped, not flagged
+    assert not [u for u in result.unparsed if u.statement_type == "COBOL_MOVE"]
+    edge = next(e for e in result.edges
+                if e.edge_type == EdgeType.WRITES_TO and e.target_id == "FILE:OUTDD")
+    for fld in ("OUT-STATUS", "OUT-PD"):
+        cm = next(m for m in edge.column_mappings
+                  if m.target_column.endswith(f"|{fld}"))
+        assert set(cm.source_columns) == {"FILE:INDD|IN-DPD", "FILE:INDD|IN-SCORE"}
+        assert "EVALUATE" in cm.transformation
+
+
+def test_search_lookup_mapped(tmp_path):
+    """SEARCH ALL table lookup links the search key argument to the looked-up
+    target, and the subscripted / literal MOVEs inside are not telemetry."""
+    result = _whole_program(tmp_path, "LGDPGM", """
+        IDENTIFICATION DIVISION.
+        PROGRAM-ID. LGDPGM.
+        ENVIRONMENT DIVISION.
+        INPUT-OUTPUT SECTION.
+        FILE-CONTROL.
+            SELECT IN-FILE  ASSIGN TO INDD.
+            SELECT OUT-FILE ASSIGN TO OUTDD.
+        DATA DIVISION.
+        FILE SECTION.
+        FD  IN-FILE.
+        01  IN-REC.
+            05  IN-COLL-CODE  PIC X(2).
+        FD  OUT-FILE.
+        01  OUT-REC.
+            05  OUT-LGD  PIC 9.9999.
+        WORKING-STORAGE SECTION.
+        01  WS-LGD-DATA.
+            05  FILLER PIC X(6) VALUE 'CA0150'.
+            05  FILLER PIC X(6) VALUE 'RE0100'.
+        01  WS-LGD-TAB REDEFINES WS-LGD-DATA.
+            05  WS-LGD-ENT OCCURS 2 TIMES
+                           ASCENDING KEY IS LGD-CODE INDEXED BY LGD-IDX.
+                10  LGD-CODE  PIC X(2).
+                10  LGD-RATE  PIC 9(4).
+        01  WS-LGD-BPS  PIC 9(4).
+        PROCEDURE DIVISION.
+        MAIN-PARA.
+            OPEN INPUT IN-FILE.
+            OPEN OUTPUT OUT-FILE.
+            SEARCH ALL WS-LGD-ENT
+                AT END
+                    MOVE 4500 TO WS-LGD-BPS
+                WHEN LGD-CODE (LGD-IDX) = IN-COLL-CODE
+                    MOVE LGD-RATE (LGD-IDX) TO WS-LGD-BPS
+            END-SEARCH.
+            COMPUTE OUT-LGD = WS-LGD-BPS / 10000.
+            WRITE OUT-REC.
+    """)
+    assert not [u for u in result.unparsed if u.statement_type == "COBOL_MOVE"]
+    edge = next(e for e in result.edges
+                if e.edge_type == EdgeType.WRITES_TO and e.target_id == "FILE:OUTDD")
+    cm = next(m for m in edge.column_mappings
+              if m.target_column.endswith("|OUT-LGD"))
+    assert cm.source_columns == ["FILE:INDD|IN-COLL-CODE"]
+    assert "SEARCH ALL" in cm.transformation
 
 
 def test_cobol_unhandled_exec_sql_verb(tmp_path):

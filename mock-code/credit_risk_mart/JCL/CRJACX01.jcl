@@ -82,11 +82,15 @@
 //            DCB=(RECFM=FB,LRECL=130,BLKSIZE=27950,DSORG=PS),
 //            UNIT=SYSDA
 //SYSIN    DD *
-  JOINKEYS FILES=F1,FIELDS=(15,15,A)
+  JOINKEYS FILES=F1,FIELDS=(15,15,A),SORTED,NOSEQCK
   JOINKEYS FILES=F2,FIELDS=(1,15,A)
-  JOIN UNPAIRED,F1,ONLY
+  JOIN UNPAIRED,F1
   REFORMAT FIELDS=(F1:1,80,F2:16,30,F2:51,2)
+* Drop closed / written-off accounts (DEFAULT_FLAG = 'C') before COBOL
+  OMIT COND=(80,1,CH,EQ,C'C')
   SORT FIELDS=(2,6,CH,A,1,8,CH,A)
+* One enriched row per account (de-dup any joined fan-out)
+  SUM FIELDS=NONE
 /*
 //*
 //***********************************************************
@@ -105,6 +109,6 @@
 //ACXFEED  DD DSN=CRDM.ACX.PROCESSED.FEED,
 //            DISP=(NEW,CATLG,DELETE),
 //            SPACE=(CYL,(80,20),RLSE),
-//            DCB=(RECFM=FB,LRECL=104,BLKSIZE=27872,DSORG=PS),
+//            DCB=(RECFM=FB,LRECL=172,BLKSIZE=27864,DSORG=PS),
 //            UNIT=SYSDA
 //*

@@ -54,7 +54,14 @@
                    A.CREDIT_LIMIT_PENCE,
                    A.COLLATERAL_PENCE,
                    A.ARREARS_DAYS,
-                   A.DEFAULT_FLAG
+                   A.DEFAULT_FLAG,
+                   A.DRAWN_BALANCE_PENCE,
+                   A.UNDRAWN_LIMIT_PENCE,
+                   A.ACCRUED_INT_PENCE,
+                   A.DAYS_PAST_DUE,
+                   A.BUREAU_SCORE,
+                   A.COLLATERAL_CODE,
+                   A.MACRO_ADJ_BPS
                FROM CRDB2.ACCOUNT_EXPOSURE A
                WHERE A.EXPOSURE_STATUS = 'OPEN'
                ORDER BY A.SORT_CODE, A.ACCOUNT_NUMBER
@@ -76,7 +83,14 @@
                      :HV-CREDIT-LIMIT-PENCE,
                      :HV-COLLATERAL-PENCE,
                      :HV-ARREARS-DAYS,
-                     :HV-DEFAULT-FLAG
+                     :HV-DEFAULT-FLAG,
+                     :HV-DRAWN-PENCE,
+                     :HV-UNDRAWN-PENCE,
+                     :HV-ACCRUED-PENCE,
+                     :HV-DAYS-PAST-DUE,
+                     :HV-BUREAU-SCORE,
+                     :HV-COLLATERAL-CODE,
+                     :HV-MACRO-ADJ-BPS
            END-EXEC.
            IF SQLCODE = 0
                PERFORM MAP-ROW-PARA
@@ -97,6 +111,13 @@
            MOVE HV-COLLATERAL-PENCE   TO AXC-COLLATERAL-PENCE.
            MOVE HV-ARREARS-DAYS       TO AXC-ARREARS-DAYS.
            MOVE HV-DEFAULT-FLAG       TO AXC-DEFAULT-FLAG.
+           MOVE HV-DRAWN-PENCE        TO AXC-DRAWN-PENCE.
+           MOVE HV-UNDRAWN-PENCE      TO AXC-UNDRAWN-PENCE.
+           MOVE HV-ACCRUED-PENCE      TO AXC-ACCRUED-PENCE.
+           MOVE HV-DAYS-PAST-DUE      TO AXC-DAYS-PAST-DUE.
+           MOVE HV-BUREAU-SCORE       TO AXC-BUREAU-SCORE.
+           MOVE HV-COLLATERAL-CODE    TO AXC-COLLATERAL-CODE.
+           MOVE HV-MACRO-ADJ-BPS      TO AXC-MACRO-ADJ-BPS.
 
       *================================================================
        CLOSE-CURSOR-PARA.
